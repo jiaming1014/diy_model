@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from chat_core import ChatMessage, _format_rag_results, _trim_hist, backtrace  # noqa: E402
+from eval import _check_keywords  # noqa: E402
 from rag_qdrant import _stable_id  # noqa: E402
 from reranker import _apply_threshold, _clamp_score  # noqa: E402
 
@@ -176,3 +177,44 @@ class TestFormatRagResults:
         out = _format_rag_results(hits)
         assert out
         assert len(out) <= c.RAG_MAX_CHARS + 500
+
+
+# ------------------------------------------------------------
+# 6. _check_keywords：eval 評分函式
+# ------------------------------------------------------------
+class TestCheckKeywords:
+    def test_all_hit(self) -> None:
+        assert _check_keywords("帶傘雷陣雨", ["帶傘", "雷陣雨"]) == ["帶傘", "雷陣雨"]
+
+    def test_partial_hit(self) -> None:
+        assert _check_keywords("只有帶傘", ["帶傘", "雷陣雨"]) == ["帶傘"]
+
+    def test_no_hit(self) -> None:
+        assert _check_keywords("無關文字", ["帶傘"]) == []
+
+    def test_empty_keywords(self) -> None:
+        assert _check_keywords("任何文字", []) == []
+
+
+# ------------------------------------------------------------
+# 7. config 一致性：三模組吃同一個真相來源
+# ------------------------------------------------------------
+class TestConfigConsistency:
+    def test_timeout_single_source(self) -> None:
+        """OLLAMA_TIMEOUT 三處一致（config.py 唯一真相）。"""
+        import config
+        import chat_core as c
+        import rag_qdrant as rq
+        import reranker as r
+        assert config.OLLAMA_TIMEOUT == c.OLLAMA_TIMEOUT == rq._CONFIG.timeout == r._ollama_timeout
+
+    def test_model_single_source(self) -> None:
+        import config
+        import chat_core as c
+        assert config.OLLAMA_MODEL == c.OLLAMA_MODEL
+
+    def test_embed_model_untouched(self) -> None:
+        """嵌入模型維持 nomic-embed-text，不被聊天模型牽連。"""
+        import config
+        import rag_qdrant as rq
+        assert config.EMBED_MODEL == "nomic-embed-text" == rq._CONFIG.embed_model

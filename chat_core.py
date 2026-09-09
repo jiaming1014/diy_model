@@ -27,7 +27,6 @@ from typing import NotRequired  # TypedDict 中可有可無的鍵
 from zoneinfo import ZoneInfo  # ZoneInfo("Asia/Taipei") 取得台灣時間
 import json  # 解析工具參數（arguments 可能是 JSON 字串）
 import logging  # 取代 print，讓降級訊息可分級、不污染串流輸出
-import os  # 讀環境變數 OLLAMA_MODEL，換模型不用改程式碼
 import re  # 正則統一清標點，比多層 strip 更穩
 import threading  # 歷史紀錄加鎖，避免多執行緒同時改 hist 打架
 import time  # 重試退避睡眠用
@@ -46,38 +45,20 @@ except Exception:  # noqa: BROAD_EXCEPT_OK - rag 模組缺失時仍要能純網�
         return []
 
 
-def _int_env(name: str, default: int) -> int:
-    """安全讀整數環境變數，寫壞回預設不炸 import｜新手：旋鈕轉壞就當沒轉。」"""
-    try:
-        return int(os.getenv(name, str(default)).strip())
-    except (ValueError, AttributeError):
-        logger.warning("環境變數 %s 解析失敗，使用預設 %s", name, default)
-        return default
-
-
-def _float_env(name: str, default: float) -> float:
-    """安全讀浮點環境變數，同上。」"""
-    try:
-        return float(os.getenv(name, str(default)).strip())
-    except (ValueError, AttributeError):
-        logger.warning("環境變數 %s 解析失敗，使用預設 %s", name, default)
-        return default
-
-
-# --- 全域常數設定 ---
-OLLAMA_MODEL: Final[str] = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
-OLLAMA_TIMEOUT: Final[float] = _float_env("OLLAMA_TIMEOUT", 120.0)  # 優化：HTTP 逾時，避免 Ollama/雲端卡死
-SEARCH_MAX_RESULTS: Final[int] = _int_env("SEARCH_MAX_RESULTS", 3)
-MAX_TOOL_ROUNDS: Final[int] = _int_env("MAX_TOOL_ROUNDS", 2)
-SEARCH_QUERY_MAX_CHARS: Final[int] = _int_env("SEARCH_QUERY_MAX_CHARS", 200)
-SEARCH_TIMEOUT: Final[float] = _float_env("SEARCH_TIMEOUT", 10.0)
-RAG_MAX_RESULTS: Final[int] = _int_env("RAG_MAX_RESULTS", 3)
-RAG_ENABLE: Final[bool] = os.getenv("RAG_ENABLE", "1") != "0"
-OLLAMA_RETRIES: Final[int] = _int_env("OLLAMA_RETRIES", 1)
-_SEARCH_CACHE_MAX: Final[int] = _int_env("SEARCH_CACHE_MAX", 128)
-_SEARCH_CACHE_TTL: Final[float] = _float_env("SEARCH_CACHE_TTL", 300.0)  # 優化：快取 5 分鐘過期，避免舊新聞殘留
-HIST_MAX_CHARS: Final[int] = _int_env("HIST_MAX_CHARS", 6000)  # 優化：歷史字數預算，超過從舊的裁
-RAG_MAX_CHARS: Final[int] = _int_env("RAG_MAX_CHARS", 3000)  # 優化：本地筆記字數預算，防止上下文爆量
+# --- 全域常數設定（唯一真相在 config.py，這裡保留同名，對外寫法不變）---
+from config import HIST_MAX_CHARS as HIST_MAX_CHARS
+from config import MAX_TOOL_ROUNDS as MAX_TOOL_ROUNDS
+from config import OLLAMA_MODEL as OLLAMA_MODEL
+from config import OLLAMA_RETRIES as OLLAMA_RETRIES
+from config import OLLAMA_TIMEOUT as OLLAMA_TIMEOUT
+from config import RAG_ENABLE as RAG_ENABLE
+from config import RAG_MAX_CHARS as RAG_MAX_CHARS
+from config import RAG_MAX_RESULTS as RAG_MAX_RESULTS
+from config import SEARCH_CACHE_MAX as _SEARCH_CACHE_MAX
+from config import SEARCH_CACHE_TTL as _SEARCH_CACHE_TTL
+from config import SEARCH_MAX_RESULTS as SEARCH_MAX_RESULTS
+from config import SEARCH_QUERY_MAX_CHARS as SEARCH_QUERY_MAX_CHARS
+from config import SEARCH_TIMEOUT as SEARCH_TIMEOUT
 
 # 優化：建立帶逾時的共用 client，避免 ollama.chat 等不到就永遠卡住
 _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)

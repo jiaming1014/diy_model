@@ -25,34 +25,19 @@
 import concurrent.futures  # 給 probe 加逾時，避免 ollama.list 卡住
 import json
 import logging
-import os
 import re
 import threading
 
+# 設定唯一真相在 config.py，這裡保留同名，對外寫法與測試 mock 不變
+from config import OLLAMA_TIMEOUT as _ollama_timeout
+from config import RERANK_BACKEND as RERANK_BACKEND
+from config import RERANK_ENABLE as RERANK_ENABLE
+from config import RERANK_LLM_MODEL as RERANK_LLM_MODEL
+from config import RERANK_MODEL as RERANK_MODEL
+from config import RERANK_SNIPPET_CHARS as RERANK_SNIPPET_CHARS
+from config import RERANK_THRESHOLD as RERANK_THRESHOLD
+
 logger = logging.getLogger(__name__)
-
-
-def _int_env(name: str, default: int) -> int:
-    """安全讀整數環境變數，寫壞回預設不炸 import。」"""
-    try:
-        return int(str(os.getenv(name, str(default))).strip())
-    except (ValueError, AttributeError):
-        logger.warning("環境變數 %s 解析失敗，使用預設 %s", name, default)
-        return default
-
-
-# --- 可用環境變數覆寫的設定 ---
-RERANK_ENABLE: bool = os.getenv("RERANK_ENABLE", "1") != "0"
-RERANK_BACKEND: str = os.getenv("RERANK_BACKEND", "auto").strip().lower()
-RERANK_MODEL: str = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-RERANK_LLM_MODEL: str = os.getenv("RERANK_LLM_MODEL", os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud"))
-RERANK_SNIPPET_CHARS: int = _int_env("RERANK_SNIPPET_CHARS", 300)
-try:
-    RERANK_THRESHOLD: float = float(str(os.getenv("RERANK_THRESHOLD", "")).strip() or "nan")
-    if RERANK_THRESHOLD != RERANK_THRESHOLD:  # nan 表示未設
-        RERANK_THRESHOLD = float("-inf")
-except ValueError:
-    RERANK_THRESHOLD = float("-inf")
 
 _cross_model = None
 _cross_model_name = ""
@@ -60,7 +45,6 @@ _cross_lock = threading.Lock()
 
 # 優化：延遲建立帶逾時的 ollama client（避免缺套件時 import 就炸）
 _ollama = None
-_ollama_timeout = _int_env("OLLAMA_TIMEOUT", 120)
 
 
 def _get_ollama():

@@ -23,7 +23,6 @@ import argparse
 import csv
 import hashlib
 import logging
-import os
 from pathlib import Path
 import threading
 
@@ -31,42 +30,27 @@ import ollama
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 
+# 設定唯一真相在 config.py，這裡保留 RAGConfig 介面（欄位名不變）
+import config as _config
+
 logger = logging.getLogger(__name__)
-
-
-def _int_env(name: str, default: int) -> int:
-    """安全讀整數環境變數，寫壞回預設不炸 import。」"""
-    try:
-        return int(str(os.getenv(name, str(default))).strip())
-    except (ValueError, AttributeError):
-        logger.warning("環境變數 %s 解析失敗，使用預設 %s", name, default)
-        return default
-
-
-def _float_env(name: str, default: float) -> float:
-    """安全讀浮點環境變數，同上。」"""
-    try:
-        return float(str(os.getenv(name, str(default))).strip())
-    except (ValueError, AttributeError):
-        logger.warning("環境變數 %s 解析失敗，使用預設 %s", name, default)
-        return default
 
 
 @dataclass(frozen=True)
 class RAGConfig:
-    """RAG 可調參數集中表，內部唯一真相｜新手：所有旋鈕收在同一張面板。」"""
+    """RAG 可調參數集中表，預設值來自 config.py｜新手：所有旋鈕收在同一張面板。」"""
 
-    url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
-    collection: str = os.getenv("QDRANT_COLLECTION", "notes")
-    embed_model: str = os.getenv("EMBED_MODEL", "nomic-embed-text")
-    vision_model: str = os.getenv("VISION_MODEL", "llava:latest")
-    timeout: float = _float_env("OLLAMA_TIMEOUT", 120.0)  # 優化：HTTP 逾時，避免嵌入/視覺卡死
-    chunk_chars: int = _int_env("CHUNK_CHARS", 800)
-    chunk_overlap: int = _int_env("CHUNK_OVERLAP", 100)
-    rerank_recall: int = _int_env("RERANK_RECALL", 15)
-    embed_batch: int = _int_env("EMBED_BATCH", 32)
-    upsert_batch: int = _int_env("UPSERT_BATCH", 64)
-    chunk_max_tokens: int = _int_env("CHUNK_MAX_TOKENS", 0)  # 優化：>0 啟用 token 預算，需 pip install tiktoken，0 表示只用字元切
+    url: str = _config.QDRANT_URL
+    collection: str = _config.QDRANT_COLLECTION
+    embed_model: str = _config.EMBED_MODEL
+    vision_model: str = _config.VISION_MODEL
+    timeout: float = _config.OLLAMA_TIMEOUT
+    chunk_chars: int = _config.CHUNK_CHARS
+    chunk_overlap: int = _config.CHUNK_OVERLAP
+    rerank_recall: int = _config.RERANK_RECALL
+    embed_batch: int = _config.EMBED_BATCH
+    upsert_batch: int = _config.UPSERT_BATCH
+    chunk_max_tokens: int = _config.CHUNK_MAX_TOKENS
 
 
 _CONFIG = RAGConfig()
@@ -113,7 +97,7 @@ _cached_url = ""
 # 優化：問題向量快取，同一問句重複檢索不再重新嵌入（省時間，回覆品質不變）
 _query_vec_cache: dict[str, list[float]] = {}
 _query_vec_cache_lock = threading.Lock()
-_QUERY_VEC_CACHE_MAX: int = _int_env("QUERY_VEC_CACHE_MAX", 256)
+_QUERY_VEC_CACHE_MAX: int = _config.QUERY_VEC_CACHE_MAX
 
 
 def _embed_query_vec(query: str) -> list[float] | None:
