@@ -120,6 +120,7 @@ _REALTIME_KEYWORDS: Final[tuple[str, ...]] = (
     "新聞", "最新", "今天新聞", "股價", "匯率", "比特幣", "加密貨幣", "天氣", "氣溫",
     "颱風", "地震", "即時", "發生", "事件", "公告", "發布", "上市", "發表", "演出",
     "票價", "賽事", "比分", "排名", "榜單", "老闆", "當下", "目前狀況", "2026", "今年",
+    "幾歲", "年齡", "出生", "多大了", "現年", "現況", "近況",
 )
 _STRIP_EDGE_RE: Final[re.Pattern[str]] = re.compile(r"^[\s，。！？、；：,.!?;:～~\-—]+|[\s，。！？、；：,.!?;:～~\-—]+$")
 
@@ -362,7 +363,7 @@ def _format_rag_results(hits: list[dict[str, str]]) -> str:
     """
     if not hits:
         return ""
-    lines = ["以下為本地筆記（優先參考，回答請用繁體中文）："]
+    lines = ["以下為本地筆記（僅供參考，若與問題無關請忽略，回答請用繁體中文）："]
     budget = RAG_MAX_CHARS
     for i, h in enumerate(hits, start=1):
         text = str(h.get("text", "") or "")
@@ -535,15 +536,61 @@ def _run_tool_loop(base: list[ChatMessage], user_msg: str, use_model: str, state
     return messages
 
 
-def _handle_tool_flow(messages: list[ChatMessage], user_msg: str, today: str, rag_block: str, use_model: str, state: ChatState | None = None) -> Iterator[str]:
+def _rag_threshold() -> float:
+    """讀重排門檻：優先吃 reranker 運行值（測試可 mock），缺失回 -inf（= 不設限）。"""
+    try:
+        import reranker as _r
+
+        return float(_r.RERANK_THRESHOLD)
+    except Exception:
+        return float("-inf")
+
+
+_RAG_VECTOR_FLOOR: Final[float] = 0.5  # 未設門檻時，0~1 餘弦分數的內建地板，擋明顯不相關命中
+
+
+def _rag_adequate(hits: list[dict[str, str]] | None) -> bool:
+    """RAG 是否真夠用：有命中且最高分過門檻才算夠，避免不相關筆記誤判為夠用。"""
+    if not hits:
+        return False
+    scores: list[float] = []
+    for h in hits:
+        try:
+            v = h.get("score", None)
+            if v is None or v == "":
+                continue
+            f = float(v)  # type: ignore[arg-type]
+            if f != f or f == float("inf"):
+                continue  # nan 與缺分數哨兵當無分數
+            scores.append(f)
+        except (TypeError, ValueError):
+            continue
+    if not scores:
+        return True  # 無分數可判，沿用舊行為（有命中即夠）
+    try:
+        thresh = _rag_threshold()
+    except Exception:
+        thresh = float("-inf")
+    if thresh > float("-inf"):
+        return max(scores) >= thresh
+    # 未設門檻：僅對 0~1 餘弦分數用內建地板擋明顯不相關；其他量尺沿用舊行為
+    if all(0.0 <= s <= 1.0 for s in scores):
+        return max(scores) >= _RAG_VECTOR_FLOOR
+    return True
+
+
+def _handle_tool_flow(messages: list[ChatMessage], user_msg: str, today: str, rag_block: str, use_model: str, state: ChatState | None = None, rag_hits: list[dict[str, str]] | None = None) -> Iterator[str]:
     """工具流程收尾：必要時補傳統搜尋，再串流回傳。」
 
     優化：RAG 已有命中（本地資料夠）時不再無條件補搜網；
     只有 RAG 空手、或明確要求即時資料，才補一次網路搜尋。
     """
     st = _resolve_state(state)
-    # 是否有本機足夠依據：本地筆記有命中，或問句本身不需外部事實（閒聊）
-    local_adequate = bool(rag_block) or _is_chitchat(user_msg)
+    # 是否有本機足夠依據：本地筆記有命中且分數過門檻，或問句本身不需外部事實（閒聊）
+    if rag_hits is not None:
+        local_adequate = _rag_adequate(rag_hits) or _is_chitchat(user_msg)
+    else:
+        local_adequate = bool(rag_block) or _is_chitchat(user_msg)
     # 明確要求即時資料時，本地命中不足以取代網路，仍要補搜
     wants_realtime = _needs_realtime(user_msg)
     needs_legacy_search = all(m.get("role") != "tool" for m in messages) and not local_adequate
@@ -597,6 +644,10 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
     """
     st = _resolve_state(state)
     use_model = _resolve_model(model)
+    # 修正：每輪先清空上一輪殘留，避免本輪未搜網時 CLI 誤印舊來源
+    with _hist_lock:
+        st.last_rag.clear()
+        st.last_sources.clear()
     if _is_date_query(user_msg):
         yield _handle_date_query(user_msg, state=st)
         return
@@ -613,7 +664,7 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
     if search_g is True:
         try:
             messages = _run_tool_loop(base, user_msg, use_model, state=st)
-            yield from _handle_tool_flow(messages, user_msg, today, rag_block, use_model, state=st)
+            yield from _handle_tool_flow(messages, user_msg, today, rag_block, use_model, state=st, rag_hits=rag_hits)
             return
         except Exception as e:  # noqa: BROAD_EXCEPT_OK - 工具流程失敗降級為舊流程
             logger.warning("工具流程降級為傳統流程：%s", e)
