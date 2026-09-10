@@ -18,11 +18,15 @@
 - 測試查詢：python rag_qdrant.py --query "台北天氣如何"
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import argparse
 import csv
 import hashlib
+import json
 import logging
+import re
+import time
 from pathlib import Path
 import threading
 
@@ -51,12 +55,50 @@ class RAGConfig:
     embed_batch: int = _config.EMBED_BATCH
     upsert_batch: int = _config.UPSERT_BATCH
     chunk_max_tokens: int = _config.CHUNK_MAX_TOKENS
+    image_max_mb: int = _config.INGEST_IMAGE_MAX_MB
+    pdf_max_pages: int = _config.INGEST_PDF_MAX_PAGES
+    csv_max_rows: int = _config.INGEST_CSV_MAX_ROWS
+    text_max_chars: int = _config.INGEST_TEXT_MAX_CHARS
+    docx_max_paras: int = _config.INGEST_DOCX_MAX_PARAS
 
 
 _CONFIG = RAGConfig()
 
 # 優化：建立帶逾時的共用 client，避免 ollama.embed/chat 卡死
 _ollama = ollama.Client(timeout=_CONFIG.timeout)
+
+
+def _sync_config() -> None:
+    """P10 即時同步：重建 _CONFIG 與快取上限，免重啟生效。」"""
+    global _CONFIG, _QUERY_VEC_CACHE_MAX, _QUERY_VEC_CACHE_TTL, _ollama
+    try:
+        _CONFIG = RAGConfig(
+            url=_config.QDRANT_URL,
+            collection=_config.QDRANT_COLLECTION,
+            embed_model=_config.EMBED_MODEL,
+            vision_model=_config.VISION_MODEL,
+            timeout=_config.OLLAMA_TIMEOUT,
+            chunk_chars=_config.CHUNK_CHARS,
+            chunk_overlap=_config.CHUNK_OVERLAP,
+            rerank_recall=_config.RERANK_RECALL,
+            embed_batch=_config.EMBED_BATCH,
+            upsert_batch=_config.UPSERT_BATCH,
+            chunk_max_tokens=_config.CHUNK_MAX_TOKENS,
+            image_max_mb=_config.INGEST_IMAGE_MAX_MB,
+            pdf_max_pages=_config.INGEST_PDF_MAX_PAGES,
+            csv_max_rows=_config.INGEST_CSV_MAX_ROWS,
+            text_max_chars=_config.INGEST_TEXT_MAX_CHARS,
+            docx_max_paras=_config.INGEST_DOCX_MAX_PARAS,
+        )
+        _QUERY_VEC_CACHE_MAX = _config.QUERY_VEC_CACHE_MAX
+        _QUERY_VEC_CACHE_TTL = _config.QUERY_VEC_CACHE_TTL
+        if getattr(_ollama, "_timeout", None) != _CONFIG.timeout:
+            try:
+                _ollama = ollama.Client(timeout=_CONFIG.timeout)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("RAG 配置同步失敗，沿用舊快照：%s", e)
 
 
 def get_config() -> RAGConfig:
@@ -94,27 +136,43 @@ _client_lock = threading.Lock()
 _cached_client: QdrantClient | None = None
 _cached_url = ""
 
-# 優化：問題向量快取，同一問句重複檢索不再重新嵌入（省時間，回覆品質不變）
-_query_vec_cache: dict[str, list[float]] = {}
+# 優化：問題向量快取，真 LRU＋TTL，同一問句重複檢索不再重新嵌入
+_query_vec_cache: OrderedDict[str, list[float]] = OrderedDict()
+_query_vec_cache_time: OrderedDict[str, float] = OrderedDict()
 _query_vec_cache_lock = threading.Lock()
 _QUERY_VEC_CACHE_MAX: int = _config.QUERY_VEC_CACHE_MAX
+_QUERY_VEC_CACHE_TTL: float = _config.QUERY_VEC_CACHE_TTL
 
 
 def _embed_query_vec(query: str) -> list[float] | None:
-    """問題轉向量，帶快取：同一問句重複查詢直接回之前算的向量。」"""
+    """問題轉向量，真 LRU＋TTL：命中刷新順序，過期重算。」"""
+    now = time.monotonic()
     with _query_vec_cache_lock:
         hit = _query_vec_cache.get(query)
         if hit is not None:
-            return hit
+            if now - _query_vec_cache_time.get(query, 0.0) <= _QUERY_VEC_CACHE_TTL:
+                _query_vec_cache.move_to_end(query)
+                _query_vec_cache_time.move_to_end(query)
+                return list(hit)
+            _query_vec_cache.pop(query, None)
+            _query_vec_cache_time.pop(query, None)
     vecs = _embed_texts([query])
     if not vecs:
         return None
     vec = vecs[0]
     with _query_vec_cache_lock:
-        if len(_query_vec_cache) >= _QUERY_VEC_CACHE_MAX:
-            # 超量淘汰最舊（dict 保插入序）
-            _query_vec_cache.pop(next(iter(_query_vec_cache)), None)
+        # 先清過期再寫入
+        expired = [k for k, t in _query_vec_cache_time.items() if now - t > _QUERY_VEC_CACHE_TTL]
+        for k in expired:
+            _query_vec_cache.pop(k, None)
+            _query_vec_cache_time.pop(k, None)
         _query_vec_cache[query] = vec
+        _query_vec_cache_time[query] = now
+        _query_vec_cache.move_to_end(query)
+        _query_vec_cache_time.move_to_end(query)
+        while len(_query_vec_cache) > _QUERY_VEC_CACHE_MAX:
+            oldest, _ = _query_vec_cache.popitem(last=False)
+            _query_vec_cache_time.pop(oldest, None)
     return vec
 
 
@@ -177,8 +235,33 @@ def _over_budget(buf: str, chunk_chars: int, chunk_tokens: int) -> bool:
     return False
 
 
+_SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;…])\s*")
+
+
+def _split_sentences(para: str) -> list[str]:
+    """按中英句號切句，無標點的長句保留原樣交給字元切。」"""
+    parts = [s.strip() for s in _SENT_SPLIT_RE.split(para.strip()) if s.strip()]
+    return parts or ([para.strip()] if para.strip() else [])
+
+
+def _overlap_tail(buf: str, ov: int) -> str:
+    """取重疊尾巴並對齊句首，避免半句開頭。」"""
+    if ov <= 0:
+        return ""
+    if len(buf) <= ov:
+        return buf
+    tail = buf[-ov:]
+    m = re.search(r"[。！？!?；;\n]", tail)
+    if m:
+        aligned = tail[m.end():].lstrip()
+        # 對齊後太短則保留原尾巴，避免重疊失效
+        if len(aligned) >= 20:
+            return aligned
+    return tail
+
+
 def _chunk_text(text: str, chunk_chars: int | None = None, overlap: int | None = None, chunk_tokens: int | None = None) -> list[str]:
-    """把長文切成小塊：先按空行分段，再按字數/token 切，塊間留重疊。」"""
+    """把長文切成小塊：段落→句子累積，超預算即切，塊間句子對齊重疊。」"""
     cc = chunk_chars if chunk_chars is not None else _CONFIG.chunk_chars
     ov = overlap if overlap is not None else _CONFIG.chunk_overlap
     ct = chunk_tokens if chunk_tokens is not None else _CONFIG.chunk_max_tokens
@@ -188,18 +271,56 @@ def _chunk_text(text: str, chunk_chars: int | None = None, overlap: int | None =
     paras = [p.strip() for p in clean.split("\n\n") if p.strip()]
     chunks: list[str] = []
     buf = ""
+
+    def _flush() -> None:
+        nonlocal buf
+        if buf.strip():
+            chunks.append(buf.strip())
+            buf = _overlap_tail(buf, ov)
+
     for para in paras:
-        probe = (buf + "\n\n" + para).strip() if buf else para
-        if buf and _over_budget(probe, cc, ct):
-            chunks.append(buf)
-            buf = buf[-ov:] + "\n\n" + para if len(buf) > ov else para
-        else:
-            buf = probe
+        for sent in _split_sentences(para):
+            # 單句本身超長（無標點長串）：先硬切，避免單塊撐爆預算
+            while not buf and _over_budget(sent, cc, ct):
+                chunks.append(sent[:cc].strip())
+                sent = (_overlap_tail(sent[:cc], ov) + sent[cc:]).strip()
+                if not sent:
+                    break
+            if not sent:
+                continue
+            probe = (buf + " " + sent).strip() if buf else sent
+            if buf and _over_budget(probe, cc, ct):
+                chunks.append(buf.strip())
+                buf = _overlap_tail(buf, ov)
+                # 重疊＋本句仍超標（單句超長），硬切本句
+                while _over_budget((buf + " " + sent).strip() if buf else sent, cc, ct):
+                    room = cc - len(buf) - 1 if buf else cc
+                    if room <= 0:
+                        chunks.append(buf.strip())
+                        buf = _overlap_tail(buf, ov)
+                        continue
+                    chunks.append(((buf + " " + sent[:room]).strip()) if buf else sent[:room].strip())
+                    sent = sent[room:]
+                    buf = _overlap_tail(chunks[-1], ov)
+                buf = (buf + " " + sent).strip() if buf else sent
+            else:
+                buf = probe
+        # 段落邊界：若已超預算則硬切落袋，避免跨段無限累積與超大單塊
         while _over_budget(buf, cc, ct):
-            chunks.append(buf[:cc])
-            buf = buf[cc - ov:]
+            chunks.append(buf[:cc].strip())
+            buf = (_overlap_tail(buf[:cc], ov) + buf[cc:]).strip()
+            if not buf:
+                break
     if buf.strip():
-        chunks.append(buf.strip())
+        # 最後殘留若超標，沿用硬切保底
+        while _over_budget(buf, cc, ct):
+            chunks.append(buf[:cc].strip())
+            buf = _overlap_tail(buf[:cc], ov) + buf[cc:]
+            buf = buf.strip()
+            if not buf:
+                break
+        if buf.strip():
+            chunks.append(buf.strip())
     return chunks
 
 
@@ -252,7 +373,7 @@ def _embed_with_order(texts: list[str]) -> dict[int, list[float]]:
 
 
 def ensure_collection(dim: int) -> None:
-    """若收藏集不存在就建立；已存在則什麼都不做。」"""
+    """若收藏集不存在就建立；維度不符直接拋錯，早失敗比空轉好。」"""
     client = _client()
     try:
         info = client.get_collection(_CONFIG.collection)
@@ -260,9 +381,11 @@ def ensure_collection(dim: int) -> None:
         vectors = getattr(params, "vectors", None)
         existing_dim = getattr(vectors, "size", None)
         if existing_dim is not None and existing_dim != dim:
-            logger.warning("現有維度與模型維度不符（現有 %s，模型 %s），請換收藏集名稱", existing_dim, dim)
+            raise RuntimeError(f"收藏集 {_CONFIG.collection} 維度不符（現有 {existing_dim}，模型 {dim}），請換 QDRANT_COLLECTION 名稱或重建")
         return
     except Exception as e:
+        if "維度不符" in str(e):
+            raise
         msg = str(e).lower()
         if any(k in msg for k in ("connect", "refused", "connection", "timeout", "unreachable")):
             raise RuntimeError(f"連不上 Qdrant（{_CONFIG.url}）：{e}") from e
@@ -276,29 +399,35 @@ def ensure_collection(dim: int) -> None:
 
 
 def _read_pdf(fp: Path) -> str:
-    """讀 .pdf：逐頁抽文字再合併。缺 pypdf 時拋出提示。」"""
+    """讀 .pdf：逐頁抽文字再合併，超頁數截斷。缺 pypdf 時拋出提示。」"""
     try:
         from pypdf import PdfReader
     except ImportError as e:
         raise RuntimeError(f"{fp.name} 是 PDF，但缺 pypdf，請先 pip install pypdf") from e
+    max_pages = max(1, int(_CONFIG.pdf_max_pages or 200))
     reader = PdfReader(str(fp))
     parts: list[str] = []
-    for i, page in enumerate(reader.pages, start=1):
+    total = len(reader.pages)
+    for i, page in enumerate(reader.pages[:max_pages], start=1):
         try:
             t = page.extract_text() or ""
         except Exception:
             t = ""
         if t.strip():
             parts.append(f"--- 第 {i} 頁 ---\n{t.strip()}")
+    if total > max_pages:
+        logger.warning("%s 共 %d 頁，已截斷為前 %d 頁", fp.name, total, max_pages)
+        parts.append(f"（以下 {total - max_pages} 頁已截斷）")
     return "\n\n".join(parts)
 
 
 def _read_docx(fp: Path) -> str:
-    """讀 .docx：段落＋表格都拿。」"""
+    """讀 .docx：段落＋表格都拿，超量截斷。」"""
     try:
         import docx
     except ImportError as e:
         raise RuntimeError(f"{fp.name} 是 DOCX，但缺 python-docx，請先 pip install python-docx") from e
+    max_paras = max(1, int(_CONFIG.docx_max_paras or 5000))
     doc = docx.Document(str(fp))
     parts: list[str] = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
@@ -306,16 +435,20 @@ def _read_docx(fp: Path) -> str:
             line = " | ".join(c.text.strip() for c in row.cells).strip(" |")
             if line.strip(" |"):
                 parts.append(line)
+    if len(parts) > max_paras:
+        logger.warning("%s 共 %d 段，已截斷為前 %d 段", fp.name, len(parts), max_paras)
+        parts = parts[:max_paras] + [f"（以下 {len(parts) - max_paras} 段已截斷）"]
     return "\n".join(parts)
 
 
 def _read_csv(fp: Path) -> str:
-    """讀 .csv：標頭＋每列轉文字，只用標準庫。」"""
+    """讀 .csv：標頭＋每列轉文字，超列數截斷，只用標準庫。」"""
+    max_rows = max(1, int(_CONFIG.csv_max_rows or 5000))
     with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
         try:
             sample = f.read(4096)
             f.seek(0)
-            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
         except Exception:
             f.seek(0)
             dialect = csv.excel
@@ -325,19 +458,26 @@ def _read_csv(fp: Path) -> str:
         return ""
     header = rows[0]
     lines = ["表頭：" + " | ".join(header)]
-    truncated = max(0, len(rows) - 1 - 5000)
-    for r in rows[1:5001]:
+    truncated = max(0, len(rows) - 1 - max_rows)
+    for r in rows[1:1 + max_rows]:
         if len(r) == len(header):
             lines.append("；".join(f"{h}：{v}" for h, v in zip(header, r) if v))
         else:
             lines.append(" | ".join(r))
     if truncated:
-        logger.warning("%s 超過 5000 列，已截斷 %d 列", fp.name, truncated)
+        logger.warning("%s 超過 %d 列，已截斷 %d 列", fp.name, max_rows, truncated)
     return "\n".join(lines)
 
 
 def _read_image(fp: Path) -> str:
-    """讀圖片：OCR → 視覺模型 → 檔名佔位，三層降級。」"""
+    """讀圖片：超大檔直接佔位，否則 OCR → 視覺模型 → 檔名佔位，三層降級。」"""
+    try:
+        max_bytes = max(1, int(_CONFIG.image_max_mb or 10)) * 1024 * 1024
+        size = fp.stat().st_size
+        if size > max_bytes:
+            return f"[圖片檔：{fp.name}（約 {size // 1024} KB，超過 {int(_CONFIG.image_max_mb or 10)} MB 上限未做內容辨識，僅檔名可檢索）]"
+    except Exception:
+        pass
     try:
         from PIL import Image
         import pytesseract
@@ -371,10 +511,15 @@ def _read_image(fp: Path) -> str:
 
 
 def _read_file_text(fp: Path) -> str:
-    """依副檔名分派讀檔，統一回傳純文字。」"""
+    """依副檔名分派讀檔，統一回傳純文字，純文字超長截斷。」"""
     suffix = fp.suffix.lower()
     if suffix in {".txt", ".md"}:
-        return fp.read_text(encoding="utf-8", errors="ignore")
+        text = fp.read_text(encoding="utf-8", errors="ignore")
+        max_chars = max(1000, int(_CONFIG.text_max_chars or 200000))
+        if len(text) > max_chars:
+            logger.warning("%s 共 %d 字，已截斷為前 %d 字", fp.name, len(text), max_chars)
+            return text[:max_chars] + f"\n\n（以下 {len(text) - max_chars} 字已截斷）"
+        return text
     if suffix == ".pdf":
         return _read_pdf(fp)
     if suffix == ".docx":
@@ -437,10 +582,37 @@ def _flush_batch(client: QdrantClient, batch_chunks: list[str], batch_metas: lis
     return len(points), skipped
 
 
-def ingest_folder(folder: str) -> int:
-    """把資料夾內支援檔切塊＋嵌入＋寫入 Qdrant，回傳寫入點數。」"""
+_INGEST_CACHE_NAME = ".ingest_cache.json"
+
+
+def _load_ingest_cache(root: Path) -> dict[str, dict[str, object]]:
+    """讀檔案級快取：rel -> {mtime, size, ok}，壞檔當空。」"""
+    try:
+        p = root / _INGEST_CACHE_NAME
+        if not p.is_file():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ingest_cache(root: Path, cache: dict[str, dict[str, object]]) -> None:
+    """寫檔案級快取，失敗僅警告不中斷匯入。」"""
+    try:
+        (root / _INGEST_CACHE_NAME).write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning("匯入快取寫入失敗：%s", e)
+
+
+def ingest_folder(folder: str, on_progress: object = None) -> int:
+    """把資料夾內支援檔切塊＋嵌入＋寫入 Qdrant，回傳寫入點數。
+
+    on_progress(done, total, rel)：可選進度回調，拋錯不中斷匯入。
+    """
+    _sync_config()
     root = Path(folder)
-    files = sorted([p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES and p.is_file()])
+    files = sorted([p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES and p.is_file() and p.name != _INGEST_CACHE_NAME])
     if not files:
         logger.warning("%s 內沒有支援的檔案（支援：%s），可先丟筆記進去", folder, sorted(SUPPORTED_SUFFIXES))
         return 0
@@ -449,50 +621,94 @@ def ingest_folder(folder: str) -> int:
     total = 0
     skipped_unchanged = 0
     skipped_files = 0
+    skipped_cached = 0
     pending_chunks: list[str] = []
     pending_metas: list[dict[str, str]] = []
     file_count = 0
+    ingest_cache = _load_ingest_cache(root)
+    touched: dict[str, dict[str, object]] = {}
 
-    def _drain() -> None:
+    def _drain() -> tuple[int, int]:
         nonlocal total, skipped_unchanged, pending_chunks, pending_metas
         if not pending_chunks:
-            return
+            return (0, 0)
         written, skipped = _flush_batch(client, pending_chunks, pending_metas, ensured)
         total += written
         skipped_unchanged += skipped
         pending_chunks = []
         pending_metas = []
+        return (written, skipped)
 
-    for fp in files:
+    def _report(done: int, rel: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            if callable(on_progress):
+                on_progress(done, len(files), rel)  # type: ignore[operator]
+        except Exception as e:
+            logger.warning("進度回調失敗，已忽略：%s", e)
+
+    for idx, fp in enumerate(files):
+        try:
+            rel = str(fp.relative_to(root))
+        except ValueError:
+            rel = fp.name
+        try:
+            st = fp.stat()
+        except Exception as e:
+            logger.warning("跳過 %s（%s）", fp.name, e)
+            skipped_files += 1
+            _report(idx + 1, rel)
+            continue
+        # 檔案級快跳：mtime＋size 命中且上次成功，直接跳過讀檔＋嵌入
+        cached = ingest_cache.get(rel)
+        if isinstance(cached, dict) and cached.get("mtime") == st.st_mtime and cached.get("size") == st.st_size and cached.get("ok") is True:
+            skipped_cached += 1
+            _report(idx + 1, rel)
+            continue
         try:
             text = _read_file_text(fp)
         except Exception as e:
             logger.warning("跳過 %s（%s）", fp.name, e)
             skipped_files += 1
+            _report(idx + 1, rel)
             continue
-        try:
-            rel = str(fp.relative_to(root))
-        except ValueError:
-            rel = fp.name
         chunks = _chunk_text(text)
         if not chunks:
+            touched[rel] = {"mtime": st.st_mtime, "size": st.st_size, "ok": True}
+            _report(idx + 1, rel)
             continue
         file_count += 1
+        touched[rel] = {"mtime": st.st_mtime, "size": st.st_size, "ok": False}
+        file_written = 0
+        file_skipped = 0
         for chunk in chunks:
             pending_chunks.append(chunk)
             pending_metas.append({"source": rel, "text": chunk})
             if len(pending_chunks) >= _CONFIG.embed_batch:
-                _drain()
-    _drain()
+                w, s = _drain()
+                file_written += w
+                file_skipped += s
+        # 檔尾清餘批，確保不與下一檔混批，逐檔歸因
+        w, s = _drain()
+        file_written += w
+        file_skipped += s
+        # 逐檔標 ok：有寫入或有未變跳過才算成功，嵌入全失敗下次重試
+        if (file_written + file_skipped) > 0:
+            touched[rel]["ok"] = True
+        _report(idx + 1, rel)
+    ingest_cache.update(touched)
+    _save_ingest_cache(root, ingest_cache)
     if total == 0:
-        logger.info("無需寫入（內容未變跳過 %d 塊）。", skipped_unchanged)
+        logger.info("無需寫入（快取跳過 %d 檔，內容未變跳過 %d 塊）。", skipped_cached, skipped_unchanged)
         return 0
-    logger.info("共 %d 個檔（有效 %d，跳過檔 %d，未變跳過 %d 塊），已寫入 %d 點到 %s。", len(files), file_count, skipped_files, skipped_unchanged, total, _CONFIG.collection)
+    logger.info("共 %d 個檔（有效 %d，快取跳過 %d，跳過檔 %d，未變跳過 %d 塊），已寫入 %d 點到 %s。", len(files), file_count, skipped_cached, skipped_files, skipped_unchanged, total, _CONFIG.collection)
     return total
 
 
 def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
     """把問題轉向量去 Qdrant 找最像的筆記塊，寬取後重排取精華。」"""
+    _sync_config()
     q = query.strip()
     if not q:
         return []

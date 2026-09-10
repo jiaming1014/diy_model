@@ -1,0 +1,19 @@
+# diy_model 可選依賴：缺了會自動降級，不裝也能跑核心流程
+# 安裝：pip install -r requirements-optional.txt
+# PDF 匯入
+pypdf
+# DOCX 匯入（已驗證 1.2.0）
+python-docx==1.2.0
+# 圖片 OCR（需另裝系統 tesseract）
+Pillow==12.3.0
+pytesseract
+# 重排 CrossEncoder（已驗證 6.0.1）
+sentence-transformers==6.0.1
+# token 精算（缺了改字數估算）
+tiktoken
+# CLI 上下鍵歷史（缺了退化 input）
+prompt_toolkit
+# 測試與靜態檢查
+pytest==9.1.1
+ruff
+pyright

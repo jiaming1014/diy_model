@@ -1,0 +1,5 @@
+# diy_model 核心依賴：聊天＋檢索＋測試可跑
+# 安裝：pip install -r requirements.txt
+ollama==0.6.2
+ddgs==9.16.0
+qdrant-client==1.19.0

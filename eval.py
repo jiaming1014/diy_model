@@ -19,7 +19,7 @@ import argparse
 import logging
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - Windows 下重設 stdout 編碼
 
 import chat_core
 import config as _config
@@ -62,38 +62,75 @@ CASES: list[dict] = [
 
 
 def _check_keywords(text: str, keywords: list[str]) -> list[str]:
-    """回傳命中的關鍵字（純函式，好測試）｜新手：改考卷先對答案。」"""
-    return [kw for kw in keywords if kw in text]
+    """回傳命中的關鍵字（純函式，好測試）｜新手：改考卷先對答案。
+
+    正規化大小寫＋去空白，避免 Qdrant／ulw 大小寫誤判。
+    """
+    norm = text.lower()
+    found: list[str] = []
+    for kw in keywords:
+        if kw.lower().strip() and kw.lower().strip() in norm:
+            found.append(kw)
+    return found
+
+
+def _first_hit_rank(hits: list[dict], keywords: list[str]) -> int | None:
+    """首個全命中關鍵字的排名（1 起），無則回 None，用於 MRR。」"""
+    for i, h in enumerate(hits, start=1):
+        text = str(h.get("text", "") or "")
+        if len(_check_keywords(text, keywords)) == len(keywords):
+            return i
+    return None
 
 
 def _eval_retrieval(case: dict) -> dict:
-    """檢索層：search_local 撈到的筆記有沒有含關鍵字。」"""
+    """檢索層：search_local 撈到的筆記有沒有含關鍵字，附 MRR 與召回率。」"""
     hits = search_local(case["q"], limit=3)
     blob = "\n".join(h.get("text", "") for h in hits)
     found = _check_keywords(blob, case["keywords"])
+    rank = _first_hit_rank(hits, case["keywords"])
+    rr = (1.0 / rank) if rank else 0.0
+    recall = (len(found) / len(case["keywords"])) if case["keywords"] else 1.0
     return {
         "q": case["q"],
         "pass": len(found) == len(case["keywords"]),
         "found": found,
         "missing": [k for k in case["keywords"] if k not in found],
         "hits": [(h.get("source", ""), h.get("text", "")[:40]) for h in hits],
+        "rank": rank,
+        "rr": rr,
+        "recall": recall,
     }
 
 
+def _has_citation(reply: str) -> bool:
+    """回覆有無引用標註 [來源i]／[筆記i]，純函式好測試。」"""
+    import re as _re
+
+    return bool(_re.search(r"[(［\[] *(來源|筆記) *\d+ *[)］\]]", reply))
+
+
 def _eval_model(case: dict, model: str) -> dict:
-    """模型層：chat_w 回覆有沒有採納筆記（打真實 Ollama，較慢）。」"""
+    """模型層：關鍵字＋引用雙指標（打真實 Ollama，較慢）。」"""
     state = chat_core.ChatState()  # 獨立狀態，不污染歷史檔
     reply = "".join(chat_core.chat_w(SYS_MSG, case["q"], search_g=True, model=model, state=state))
     found = _check_keywords(reply, case["keywords"])
     rag = chat_core.get_last_rag(state)
     src = chat_core.get_last_sources(state)
+    cited = _has_citation(reply)
+    kw_pass = len(found) == len(case["keywords"])
+    # 有外部依據（RAG／網路）時要求引用，無依據的純知識題只看關鍵字
+    needs_cite = len(rag) > 0 or len(src) > 0
+    cite_pass = (cited or not needs_cite)
     return {
         "q": case["q"],
-        "pass": len(found) == len(case["keywords"]),
+        "pass": kw_pass and cite_pass,
         "found": found,
         "missing": [k for k in case["keywords"] if k not in found],
         "used_rag": len(rag) > 0,
         "used_web": len(src) > 0,
+        "cited": cited,
+        "cite_pass": cite_pass,
         "reply_head": reply[:120],
     }
 
@@ -114,11 +151,13 @@ def main(argv: list[str] | None = None) -> int:
     for r in results:
         mark = "✅" if r["pass"] else "❌"
         print(f"{mark} 檢索｜{r['q']}")
-        print(f"   命中：{r['found']} 缺失：{r['missing']}")
+        print(f"   命中：{r['found']} 缺失：{r['missing']} 排名：{r['rank']} RR：{r['rr']:.2f} 召回：{r['recall']:.2f}")
         if args.verbose:
             for src, head in r["hits"]:
                 print(f"   - {src}｜{head}")
-    print(f"檢索：{ok}/{len(results)} 過")
+    mrr = sum(r["rr"] for r in results) / len(results) if results else 0.0
+    avg_recall = sum(r["recall"] for r in results) / len(results) if results else 0.0
+    print(f"檢索：{ok}/{len(results)} 過 MRR：{mrr:.2f} 平均召回：{avg_recall:.2f}")
 
     if args.with_model:
         print("=" * 60)
@@ -127,9 +166,9 @@ def main(argv: list[str] | None = None) -> int:
         m_ok = sum(1 for r in m_results if r["pass"])
         for r in m_results:
             mark = "✅" if r["pass"] else "❌"
-            path = f"RAG={'有' if r['used_rag'] else '無'}/網路={'有' if r['used_web'] else '無'}"
+            path = f"RAG={'有' if r['used_rag'] else '無'}/網路={'有' if r['used_web'] else '無'}/引用={'有' if r['cited'] else '無'}"
             print(f"{mark} 模型｜{r['q']}（{path}）")
-            print(f"   命中：{r['found']} 缺失：{r['missing']}")
+            print(f"   命中：{r['found']} 缺失：{r['missing']} 引用過：{r['cite_pass']}")
             print(f"   回覆前120字：{r['reply_head']}")
         print(f"模型：{m_ok}/{len(m_results)} 過")
         return 0 if (ok == len(results) and m_ok == len(m_results)) else 1

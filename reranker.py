@@ -29,8 +29,10 @@ import re
 import threading
 
 # 設定唯一真相在 config.py，這裡保留同名，對外寫法與測試 mock 不變
+import config as _config_module
 from config import OLLAMA_TIMEOUT as _ollama_timeout
 from config import RERANK_BACKEND as RERANK_BACKEND
+from config import RERANK_BATCH as RERANK_BATCH
 from config import RERANK_ENABLE as RERANK_ENABLE
 from config import RERANK_LLM_MODEL as RERANK_LLM_MODEL
 from config import RERANK_MODEL as RERANK_MODEL
@@ -38,6 +40,34 @@ from config import RERANK_SNIPPET_CHARS as RERANK_SNIPPET_CHARS
 from config import RERANK_THRESHOLD as RERANK_THRESHOLD
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_config() -> None:
+    """P10 即時同步：重讀 config 真相，模型名變了清掉舊 CrossEncoder。」"""
+    global _ollama_timeout, RERANK_BACKEND, RERANK_BATCH, RERANK_ENABLE
+    global RERANK_LLM_MODEL, RERANK_MODEL, RERANK_SNIPPET_CHARS, RERANK_THRESHOLD
+    global _cross_model, _cross_model_name, _ollama
+    try:
+        _m = _config_module
+        _ollama_timeout = _m.OLLAMA_TIMEOUT
+        RERANK_BACKEND = _m.RERANK_BACKEND
+        RERANK_BATCH = _m.RERANK_BATCH
+        RERANK_ENABLE = _m.RERANK_ENABLE
+        RERANK_LLM_MODEL = _m.RERANK_LLM_MODEL
+        RERANK_SNIPPET_CHARS = _m.RERANK_SNIPPET_CHARS
+        RERANK_THRESHOLD = _m.RERANK_THRESHOLD
+        if RERANK_MODEL != _m.RERANK_MODEL:
+            RERANK_MODEL = _m.RERANK_MODEL
+            _cross_model = None
+            _cross_model_name = ""
+        # ollama 超時變了則重建，下次 _get_ollama 會用新逾時
+        if _ollama is not None:
+            try:
+                _ollama = None
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("重排配置同步失敗，沿用舊快照：%s", e)
 
 _cross_model = None
 _cross_model_name = ""
@@ -187,18 +217,29 @@ def probe_availability(timeout_s: float = 5.0) -> dict[str, bool]:
 
 
 def _rerank_cross(query: str, docs: list[dict[str, str]], top_k: int) -> list[dict[str, str]] | None:
-    """用 CrossEncoder 打分排序，失敗回 None 讓上層換備援。」"""
+    """用 CrossEncoder 分批打分排序，失敗回 None 讓上層換備援。」"""
     model = _load_cross_model()
     if model is None:
         return None
     try:
-        # 註：按字元截 2000 是省記憶體的近似，中文大致 1 字 ~ 1-2 token
-        pairs = [[query, str(d.get("text", "") or "")[:2000]] for d in docs]
-        scores = model.predict(pairs)
+        batch = max(1, int(RERANK_BATCH or 8))
+        scores: list[float] = []
+        for i in range(0, len(docs), batch):
+            # 註：按字元截 2000 是省記憶體的近似，中文大致 1 字 ~ 1-2 token
+            pairs = [[query, str(d.get("text", "") or "")[:2000]] for d in docs[i:i + batch]]
+            try:
+                part = model.predict(pairs)
+            except Exception as e:
+                logger.warning("CrossEncoder 批次 %d 失敗（%s），嘗試備援", i // batch, e)
+                return None
+            scores.extend(float(s) for s in part)
+        if len(scores) != len(docs):
+            logger.warning("CrossEncoder 分數數量不符（%d vs %d），降級備援", len(scores), len(docs))
+            return None
         ranked = []
         for d, s in zip(docs, scores):
             item = dict(d)
-            item["score"] = float(s)
+            item["score"] = float(s)  # pyright: ignore[reportArgumentType] - score 欄位實為數字，型別沿用舊宣告
             ranked.append(item)
         ranked.sort(key=lambda x: x["score"], reverse=True)
         return ranked[:top_k]
@@ -245,6 +286,25 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
     nums = [_clamp_score(x) for x in re.findall(r"\d+(?:\.\d+)?", text)]
     if len(nums) == len(docs) and "[" in text and "]" in text:
         return nums[:len(docs)]
+    # P6 強韌：整批解析失敗改逐筆打分，單筆失敗記 0 分不丟整批
+    logger.warning("LLM 整批解析失敗，改逐筆備援（%d 筆）", len(docs))
+    per_doc: list[float] = []
+    for d in docs:
+        snippet = str(d.get("text", "") or "")[:RERANK_SNIPPET_CHARS].replace("\n", " ")
+        try:
+            single = client.chat(
+                model=RERANK_LLM_MODEL,
+                messages=[{"role": "user", "content": f"你是檢索評分員。依與問題的相關程度，為文件打 0~10 分，只回一個數字。\n問題：{query[:500]}\n文件：{snippet}"}],
+            )
+            s_raw = single["message"] if isinstance(single, dict) else getattr(single, "message", None)
+            s_text = str(s_raw.get("content") if isinstance(s_raw, dict) else getattr(s_raw, "content", "") or "")
+            m = re.search(r"\d+(?:\.\d+)?", s_text)
+            per_doc.append(_clamp_score(m.group(0)) if m else 0.0)
+        except Exception as e:
+            logger.warning("LLM 逐筆打分失敗，已記 0 分：%s", e)
+            per_doc.append(0.0)
+    if len(per_doc) == len(docs):
+        return per_doc
     logger.warning("LLM 回傳無法解析為 %d 個分數（原文前 200 字：%r），已降級為原順序", len(docs), text[:200])
     return None
 
@@ -257,7 +317,7 @@ def _rerank_llm(query: str, docs: list[dict[str, str]], top_k: int) -> list[dict
     ranked = []
     for d, s in zip(docs, scores):
         item = dict(d)
-        item["score"] = float(s)
+        item["score"] = float(s)  # pyright: ignore[reportArgumentType] - 同上
         ranked.append(item)
     ranked.sort(key=lambda x: x["score"], reverse=True)
     return ranked[:top_k]
@@ -265,6 +325,7 @@ def _rerank_llm(query: str, docs: list[dict[str, str]], top_k: int) -> list[dict
 
 def rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[str, str]]:
     """重排主入口：自動選評審，任何失敗都回原順序前 top_k，保證不拋錯。」"""
+    _sync_config()
     if not docs:
         return []
     if top_k <= 0:

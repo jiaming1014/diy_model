@@ -16,6 +16,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -50,6 +51,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def _hist_keep_n() -> int:
+    """歷史保留則數與 chat_core.backtrace 對齊，避免兩處寫死脫鉤。」"""
+    try:
+        return max(2, 2 * int(_core.backtrace))
+    except Exception:
+        return 8
+
+
+def _content_key(role: object, content: object) -> tuple:
+    """去重鍵只存雜湊，不存全文，避免長問答撐大集合。」"""
+    text = content if isinstance(content, str) else str(content or "")
+    digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return (role, len(text), digest)
+
+
+def _trim_tail_to_budget(msgs: list[dict]) -> list[dict]:
+    """按 HIST_MAX_CHARS 字數＋token 雙預算從舊裁剪，與 chat_core._trim_hist 同尺。」"""
+    try:
+        budget = int(_core.HIST_MAX_CHARS)
+    except Exception:
+        return msgs
+    try:
+        tok_len = _core._content_tokens
+    except Exception:
+        tok_len = lambda s: len(s or "")  # noqa: E731 - 退化字數
+    total_chars = sum(len(str(m.get("content", "") or "")) for m in msgs)
+    total_toks = sum(tok_len(str(m.get("content", "") or "")) for m in msgs)
+    i = 0
+    while i < len(msgs) and (total_chars > budget or total_toks > budget):
+        total_chars -= len(str(msgs[i].get("content", "") or ""))
+        total_toks -= tok_len(str(msgs[i].get("content", "") or ""))
+        i += 1
+    # 保持 user→assistant 成對：若從 assistant 開始多裁一則
+    tail = msgs[i:]
+    if len(tail) % 2 == 1 and tail and tail[0].get("role") == "assistant":
+        tail = tail[1:]
+    return tail
+
+
 def _load_history(state: ChatState, path: Path | None = None) -> None:
     """載入上次存的問答，壞檔當無歷史｜新手：開店先把上次的小抄拿出來。」"""
     p = path if path is not None else _hist_path()
@@ -58,7 +98,7 @@ def _load_history(state: ChatState, path: Path | None = None) -> None:
             return
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            for m in data[-8:]:  # 只載最後 4 組，避免舊檔過大
+            for m in data[-_hist_keep_n():]:
                 if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
                     state.hist.append({"role": m["role"], "content": m["content"]})
     except Exception as e:
@@ -66,7 +106,7 @@ def _load_history(state: ChatState, path: Path | None = None) -> None:
 
 
 def _save_history(state: ChatState, path: Path | None = None) -> None:
-    """原子合併存檔：讀現有+本次去重留最後 4 組，tmp+replace 防半寫｜新手：關店先對帳再鎖門。」"""
+    """原子合併存檔：讀現有+本次去重留最後 N 組＋字數預算，tmp+replace 防半寫｜新手：關店先對帳再鎖門。」"""
     p = path if path is not None else _hist_path()
     with _hist_lock:
         try:
@@ -79,16 +119,16 @@ def _save_history(state: ChatState, path: Path | None = None) -> None:
                 except Exception:
                     pass  # 舊檔壞掉當空的，直接覆寫
             merged.extend([{"role": m["role"], "content": m["content"]} for m in state.hist])
-            # 去重保序：同 role+content 只留最後一次
+            # 去重保序：同 role+雜湊只留最後一次
             seen: set[tuple] = set()
             dedup: list[dict] = []
             for m in reversed(merged):
-                key = (m.get("role"), m.get("content"))
+                key = _content_key(m.get("role"), m.get("content"))
                 if key not in seen:
                     seen.add(key)
                     dedup.append(m)
             dedup.reverse()
-            tail = dedup[-8:]
+            tail = _trim_tail_to_budget(dedup[-_hist_keep_n():])
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_text(json.dumps(tail, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -109,7 +149,7 @@ def _print_rag(state: ChatState) -> None:
 
 
 def _print_sources(state: ChatState) -> None:
-    """顯示網路參考來源，有來源才印。」"""
+    """顯示網路參考來源，有來源才印，編號與提示詞 [來源i] 對齊。」"""
     sources = get_last_sources(state)
     if not sources:
         return
@@ -117,7 +157,7 @@ def _print_sources(state: ChatState) -> None:
     for i, src in enumerate(sources, start=1):
         title = src.get("title", "")
         url = src.get("url", "")
-        print(f"  [{i}] {title} - {url}", flush=True)
+        print(f"  [來源{i}] {title} - {url}", flush=True)
     print('', flush=True)
 
 
@@ -139,10 +179,28 @@ def main(argv: list[str] | None = None) -> None:
         # 相容舊寫法：把載入的歷史同步給全域，舊外掛讀 hist 不會空
         _core.hist.extend([m for m in state.hist if m not in _core.hist])
     print(f"小助理已啟動（模型：{model}，搜尋：{'開' if search_g else '關'}），輸入 q 可離開。", flush=True)
+    # P12 體感：有 prompt_toolkit 走歷史上下鍵＋持久歷史，缺套件退化 input
+    _prompt = None
+    try:
+        from prompt_toolkit import PromptSession as _Session  # type: ignore[import-not-found]
+        from prompt_toolkit.history import FileHistory as _FileHistory  # type: ignore[import-not-found]
+
+        _prompt = _Session(history=_FileHistory(str(_hist_path().with_suffix(".prompt_hist"))))
+    except Exception:
+        _prompt = None
+    def _ask() -> str:
+        if _prompt is not None:
+            try:
+                return _prompt.prompt("你說：")
+            except (EOFError, KeyboardInterrupt):
+                raise
+            except Exception:
+                return input("你說：")
+        return input("你說：")
     try:
         while True:
             try:
-                msg = input("你說：")
+                msg = _ask()
             except (EOFError, KeyboardInterrupt):
                 print("\n再見！", flush=True)
                 break
