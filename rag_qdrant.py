@@ -266,12 +266,6 @@ def _chunk_text(text: str, chunk_chars: int | None = None, overlap: int | None =
     chunks: list[str] = []
     buf = ""
 
-    def _flush() -> None:
-        nonlocal buf
-        if buf.strip():
-            chunks.append(buf.strip())
-            buf = _overlap_tail(buf, ov)
-
     for para in paras:
         for sent in _split_sentences(para):
             # 單句本身超長（無標點長串）：先硬切，避免單塊撐爆預算
@@ -437,7 +431,10 @@ def _read_docx(fp: Path) -> str:
 
 
 def _read_csv(fp: Path) -> str:
-    """讀 .csv：標頭＋每列轉文字，超列數截斷，只用標準庫。」"""
+    """讀 .csv：標頭＋每列轉文字，超列數截斷，只用標準庫。
+
+    P15：邊讀邊數，讀到上限＋1 列即停，大 CSV 不再整檔進記憶體。
+    """
     max_rows = max(1, int(_CONFIG.csv_max_rows or 5000))
     with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
         try:
@@ -448,19 +445,25 @@ def _read_csv(fp: Path) -> str:
             f.seek(0)
             dialect = csv.excel
         reader = csv.reader(f, dialect)
-        rows = [[c.strip() for c in r] for r in reader if any(c.strip() for c in r)]
+        rows: list[list[str]] = []
+        truncated = False
+        for r in reader:
+            if any(c.strip() for c in r):
+                rows.append([c.strip() for c in r])
+                if len(rows) > max_rows + 1:  # 表頭＋上限＋至少一列超額 → 確定截斷
+                    truncated = True
+                    break
     if not rows:
         return ""
     header = rows[0]
     lines = ["表頭：" + " | ".join(header)]
-    truncated = max(0, len(rows) - 1 - max_rows)
     for r in rows[1:1 + max_rows]:
         if len(r) == len(header):
             lines.append("；".join(f"{h}：{v}" for h, v in zip(header, r) if v))
         else:
             lines.append(" | ".join(r))
     if truncated:
-        logger.warning("%s 超過 %d 列，已截斷 %d 列", fp.name, max_rows, truncated)
+        logger.warning("%s 超過 %d 列，已截斷後續列", fp.name, max_rows)
     return "\n".join(lines)
 
 
@@ -509,11 +512,13 @@ def _read_file_text(fp: Path) -> str:
     """依副檔名分派讀檔，統一回傳純文字，純文字超長截斷。」"""
     suffix = fp.suffix.lower()
     if suffix in {".txt", ".md"}:
-        text = fp.read_text(encoding="utf-8", errors="ignore")
         max_chars = max(1000, int(_CONFIG.text_max_chars or 200000))
+        # P15：只讀到上限＋1 字就停，超大純文字檔不再整檔載入記憶體
+        with fp.open("r", encoding="utf-8", errors="ignore") as f:
+            text = f.read(max_chars + 1)
         if len(text) > max_chars:
-            logger.warning("%s 共 %d 字，已截斷為前 %d 字", fp.name, len(text), max_chars)
-            return text[:max_chars] + f"\n\n（以下 {len(text) - max_chars} 字已截斷）"
+            logger.warning("%s 超過 %d 字上限，已截斷", fp.name, max_chars)
+            return text[:max_chars] + f"\n\n（已截斷，僅取前 {max_chars} 字）"
         return text
     if suffix == ".pdf":
         return _read_pdf(fp)
@@ -688,8 +693,9 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
         w, s = _drain()
         file_written += w
         file_skipped += s
-        # 逐檔標 ok：有寫入或有未變跳過才算成功，嵌入全失敗下次重試
-        if (file_written + file_skipped) > 0:
+        # P15：完成數＝寫入＋未變跳過；等於總塊數才算整檔成功。
+        # 部分嵌入失敗若誤標 ok，檔案級快取（mtime＋size）會永久跳過壞塊不再補。
+        if file_written + file_skipped >= len(chunks):
             touched[rel]["ok"] = True
         _report(idx + 1, rel)
     ingest_cache.update(touched)

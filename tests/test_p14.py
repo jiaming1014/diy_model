@@ -100,42 +100,35 @@ class TestChunkGuard:
 
 
 # ------------------------------------------------------------
-# 4. 即時問題：工具已搜過（last_sources 有值）就不重複搜
+# 4. 預補搜決策（P15：串流流程改在模型開跑前預判；
+#    舊「工具搜過就跳過補搜」的事後防重複結構已隨流程重構移除）
 # ------------------------------------------------------------
-class TestRealtimeNoDuplicateSearch:
-    def _run_flow(self, state, user_msg, messages) -> list:
+class TestPreSearchGuard:
+    def test_realtime_without_sources_triggers(self) -> None:
         import chat_core
 
-        calls: list = []
+        assert chat_core._needs_pre_search("台北今天天氣如何？", [], "", chat_core.ChatState()) is True
 
-        def _fake_search(query, max_results=None, state=None):
-            calls.append(query)
-            return []
+    def test_inadequate_local_triggers(self) -> None:
+        import chat_core
 
-        with mock.patch.object(chat_core, "_search_web", side_effect=_fake_search):
-            with mock.patch.object(chat_core, "_stream_reply", return_value=iter(())):
-                with mock.patch.object(chat_core, "_remember"):
-                    list(chat_core._handle_tool_flow(messages, user_msg, "2026-09-11", "", "m", state=state, rag_hits=[]))
-        return calls
+        assert chat_core._needs_pre_search("冷知識問題", [], "", chat_core.ChatState()) is True
 
-    def test_skip_when_sources_present(self) -> None:
+    def test_local_adequate_skips(self) -> None:
+        import chat_core
+
+        hits = [{"text": "x", "score": "0.9"}]
+        assert chat_core._needs_pre_search("這個專案的問題", hits, "", chat_core.ChatState()) is False
+
+    def test_realtime_adequate_with_sources_skips(self) -> None:
         import chat_core
 
         st = chat_core.ChatState()
         st.last_sources.append({"title": "t", "snippet": "s", "url": "u"})
-        msgs = [
-            {"role": "system", "content": "s"},
-            {"role": "tool", "content": "搜尋結果"},
-        ]
-        assert self._run_flow(st, "台北今天天氣如何？", msgs) == []
+        hits = [{"text": "x", "score": "0.9"}]
+        assert chat_core._needs_pre_search("今天天氣如何？", hits, "", st) is False
 
-    def test_search_when_no_sources(self) -> None:
+    def test_chitchat_never(self) -> None:
         import chat_core
 
-        st = chat_core.ChatState()
-        msgs = [
-            {"role": "system", "content": "s"},
-            {"role": "tool", "content": "只有日期"},
-        ]
-        calls = self._run_flow(st, "台北今天天氣如何？", msgs)
-        assert len(calls) == 1
+        assert chat_core._needs_pre_search("你好", [], "", chat_core.ChatState()) is False

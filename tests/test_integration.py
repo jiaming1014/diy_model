@@ -54,18 +54,26 @@ class TestChatLegacy:
 # ------------------------------------------------------------
 class TestChatToolFlow:
     def test_tool_loop_executes_tool(self) -> None:
-        """模型回 tool_calls → 執行工具 → 再串流。"""
-        # 模擬工具流程：_run_tool_loop 回傳含 tool 訊息的列表，_handle_tool_flow 再串流
-        tool_loop_msgs = [
-            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "search_web", "arguments": '{"query": "測試"}'}}]},
-            {"role": "tool", "content": "搜尋結果"},
-        ]
-        with mock.patch.object(chat_core, "_run_tool_loop", return_value=tool_loop_msgs) as m_loop:
-            with mock.patch.object(chat_core, "_stream_reply", return_value=iter(["結果", "OK"])) as m_stream:
-                with mock.patch.object(chat_core, "_retrieve_rag", return_value=[]):
-                    replies = list(chat_core.chat_w("sys", "最新新聞", search_g=True, model="gemma4:31b-cloud"))
-        m_loop.assert_called_once()
+        """模型回 tool_calls → 執行工具 → 再串流作答（P15 串流工具輪）。"""
+        import chat_core as c
+
+        calls: list = []
+
+        def fake_chat(**kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                tc = {"function": {"name": "search_web", "arguments": '{"query": "測試"}'}}
+                return iter([{"message": {"content": "", "tool_calls": [tc]}}])
+            return iter([{"message": {"content": "結果"}}, {"message": {"content": "OK"}}])
+
+        st = c.ChatState()
+        with mock.patch.object(c, "_retrieve_rag", return_value=[{"text": "x", "score": "0.9"}]):
+            with mock.patch.object(c, "_search_web", return_value=[]) as m_search:
+                with mock.patch.object(c._ollama, "chat", side_effect=fake_chat):
+                    replies = list(c.chat_w("sys", "問題", search_g=True, model="m", state=st))
         assert "".join(replies) == "結果OK"
+        # 本地筆記夠力 → 不預補搜；只發生工具自己那一次搜尋
+        assert m_search.call_count == 1
 
 
 # ------------------------------------------------------------

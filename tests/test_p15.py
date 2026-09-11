@@ -1,0 +1,193 @@
+"""P15 回歸測試：單次生成串流工具流程／預補搜／legacy 帶筆記／client 生命週期／
+有界讀取／整檔 ok 判定／--health，不碰真網路。"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from unittest import mock
+
+import chat_core
+import rag_qdrant as rq
+
+
+# ------------------------------------------------------------
+# 1. 優化主軸：模型沒叫工具的那一輪，串流內容就是答案（不再二次生成）
+# ------------------------------------------------------------
+class TestSingleCallAnswer:
+    def test_no_tool_answer_single_model_call(self) -> None:
+        st = chat_core.ChatState()
+        calls: list = []
+
+        def fake_chat(**kw):
+            calls.append(kw)
+            return iter([{"message": {"content": "答"}}, {"message": {"content": "案"}}])
+
+        with mock.patch.object(chat_core, "_retrieve_rag", return_value=[]):
+            with mock.patch.object(chat_core, "_search_web", return_value=[]):
+                with mock.patch.object(chat_core._ollama, "chat", side_effect=fake_chat):
+                    replies = list(chat_core.chat_w("sys", "隨意問題", search_g=True, model="m", state=st))
+        assert "".join(replies) == "答案"
+        assert len(calls) == 1  # 舊版偵測輪丟棄後會再生一次，P15 起只生成一次
+
+
+# ------------------------------------------------------------
+# 2. 工具輪：一輪工具＋一輪作答＝兩次生成，且作答輪看得到工具結果
+# ------------------------------------------------------------
+class TestToolRoundStream:
+    def test_tool_then_answer(self) -> None:
+        st = chat_core.ChatState()
+        calls: list = []
+
+        def fake_chat(**kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                tc = {"function": {"name": "search_web", "arguments": '{"query": "q"}'}}
+                return iter([{"message": {"content": "", "tool_calls": [tc]}}])
+            return iter([{"message": {"content": "完成"}}])
+
+        hits = [{"source": "s", "text": "本地", "score": "0.9"}]
+        with mock.patch.object(chat_core, "_retrieve_rag", return_value=hits):
+            with mock.patch.object(chat_core, "_search_web", return_value=[]) as m_search:
+                with mock.patch.object(chat_core._ollama, "chat", side_effect=fake_chat):
+                    replies = list(chat_core.chat_w("sys", "問題", search_g=True, model="m", state=st))
+        assert "".join(replies) == "完成"
+        assert len(calls) == 2
+        assert calls[0].get("tools")  # 工具輪帶工具
+        assert any(m.get("role") == "tool" for m in calls[1]["messages"])  # 作答輪帶工具結果
+        assert m_search.call_count == 1
+
+
+# ------------------------------------------------------------
+# 3. 預補搜：模型開跑前先搜一次（本地不夠先鋪事實、realtime 保證新鮮）
+# ------------------------------------------------------------
+class TestPreSearchFlow:
+    def test_presearch_before_model_call(self) -> None:
+        st = chat_core.ChatState()
+        order: list[str] = []
+
+        def fake_search(query, max_results=None, state=None):
+            order.append("search")
+            return []
+
+        def fake_chat(**kw):
+            order.append("model")
+            return iter([{"message": {"content": "回"}}])
+
+        with mock.patch.object(chat_core, "_search_web", side_effect=fake_search):
+            with mock.patch.object(chat_core._ollama, "chat", side_effect=fake_chat):
+                out = list(chat_core.chat_w("sys", "台北今天天氣如何？", search_g=True, model="m", state=st))
+        assert "".join(out) == "回"
+        assert order == ["search", "model"]
+
+
+# ------------------------------------------------------------
+# 4. legacy（--no-search）要真的吃本地筆記，不再白檢索
+# ------------------------------------------------------------
+class TestLegacyRagBlock:
+    def test_no_search_includes_rag_block(self) -> None:
+        st = chat_core.ChatState()
+        hits = [{"source": "a.md", "text": "筆記內容", "score": "0.9"}]
+        captured: list = []
+
+        def fake_stream(messages, model=None):
+            captured.append(messages)
+            return iter(["好"])
+
+        with mock.patch.object(chat_core, "_retrieve_rag", return_value=hits):
+            with mock.patch.object(chat_core, "_stream_reply", side_effect=fake_stream):
+                replies = list(chat_core.chat_w("sys", "筆記的問題", search_g=False, model="m", state=st))
+        assert "".join(replies) == "好"
+        user_msgs = [m for m in captured[0] if m.get("role") == "user"]
+        assert "筆記內容" in user_msgs[-1]["content"]
+
+
+# ------------------------------------------------------------
+# 5. 配置同步：換 Ollama client 前先關舊的（與 rag/reranker 同款）
+# ------------------------------------------------------------
+class TestClientLifecycle:
+    def test_sync_config_closes_replaced_client(self, monkeypatch) -> None:
+        old_client = mock.Mock()
+        monkeypatch.setattr(chat_core, "_ollama", old_client)
+        monkeypatch.setattr(chat_core, "OLLAMA_TIMEOUT", -1.0)  # 與 config 快照不同 → 觸發重建
+        new_client = mock.Mock()
+        monkeypatch.setattr(chat_core.ollama, "Client", mock.Mock(return_value=new_client))
+        chat_core._sync_config()
+        old_client.close.assert_called_once()
+        assert chat_core._ollama is new_client
+
+
+# ------------------------------------------------------------
+# 6. 匯入：部分塊嵌入失敗不得標整檔 ok，否則永遠不會補壞塊
+# ------------------------------------------------------------
+class TestIngestPartialOk:
+    def test_partial_embed_failure_not_ok(self, tmp_path: Path) -> None:
+        (tmp_path / "full.md").write_text("hello world", encoding="utf-8")
+        (tmp_path / "partial.md").write_text("A" * 900 + "\n\n" + "B" * 900, encoding="utf-8")
+
+        def fake_flush(client, chunks, metas, ensured):
+            src = metas[0].get("source", "")
+            if src == "partial.md":
+                return (1, 0)  # 只成功一部分
+            return (len(chunks), 0)
+
+        with mock.patch.object(rq, "_client"):
+            with mock.patch.object(rq, "_flush_batch", side_effect=fake_flush):
+                rq.ingest_folder(str(tmp_path))
+        import json
+
+        cache = json.loads((tmp_path / rq._INGEST_CACHE_NAME).read_text(encoding="utf-8"))
+        assert cache["full.md"]["ok"] is True
+        assert cache["partial.md"]["ok"] is False
+
+
+# ------------------------------------------------------------
+# 7. 有界讀取：超過上限的內容不再載入記憶體
+# ------------------------------------------------------------
+class TestBoundedReads:
+    def test_txt_does_not_read_beyond_limit(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        fp = tmp_path / "big.md"
+        fp.write_text("A" * 1000 + "TAIL_MARKER" + "B" * 5000, encoding="utf-8")
+        cfg = dataclasses.replace(rq._CONFIG, text_max_chars=1000)
+        with mock.patch.object(rq, "_CONFIG", cfg):
+            out = rq._read_file_text(fp)
+        assert "TAIL_MARKER" not in out
+        assert "已截斷" in out
+
+    def test_csv_stops_at_limit(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        fp = tmp_path / "big.csv"
+        fp.write_text("h1,h2\n" + "\n".join(f"a{i},b{i}" for i in range(10000)), encoding="utf-8")
+        cfg = dataclasses.replace(rq._CONFIG, csv_max_rows=5)
+        with mock.patch.object(rq, "_CONFIG", cfg):
+            out = rq._read_csv(fp)
+        assert out.count("\n") == 5  # 表頭＋上限 5 列
+
+
+# ------------------------------------------------------------
+# 8. --health 健康檢查：全通回 0、有缺回 1
+# ------------------------------------------------------------
+class TestHealthCheck:
+    def test_all_ok(self) -> None:
+        import types
+
+        import chat_cli
+
+        coll = types.SimpleNamespace(collections=[types.SimpleNamespace(name="notes")])
+        with mock.patch("reranker.probe_availability", return_value={"crossencoder": True, "llm": True}):
+            with mock.patch.object(rq, "_client") as m_client:
+                m_client.return_value.get_collections.return_value = coll
+                rc = chat_cli._run_health_check("m")
+        assert rc == 0
+
+    def test_failures_return_nonzero(self) -> None:
+        import chat_cli
+
+        with mock.patch("reranker.probe_availability", return_value={"crossencoder": False, "llm": False}):
+            with mock.patch.object(rq, "_client", side_effect=RuntimeError("boom")):
+                rc = chat_cli._run_health_check("m")
+        assert rc == 1

@@ -13,6 +13,7 @@
 - python chat_cli.py --model llama3.2:1b：指定模型
 - python chat_cli.py --no-search：關掉工具搜尋（純問模型）
 - python chat_cli.py --no-history：不載入／不存歷史
+- python chat_cli.py --health：檢查重排後端與 Qdrant 連線後結束（P15）
 """
 
 import argparse
@@ -49,6 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-search", action="store_true", help="關掉工具搜尋，純問模型")
     ap.add_argument("--verbose", action="store_true", help="顯示降級等除錯訊息")
     ap.add_argument("--no-history", action="store_true", help="不載入／不存歷史")
+    ap.add_argument("--health", action="store_true", help="檢查重排後端與 Qdrant 連線後結束（不做對話）")
     return ap.parse_args(argv)
 
 
@@ -162,6 +164,37 @@ def _print_sources(state: ChatState) -> None:
     print('', flush=True)
 
 
+def _run_health_check(model: str) -> int:
+    """--health：檢查重排後端與 Qdrant 連線，回 0 全通、1 有缺（P15）。
+
+    唯讀操作、不進對話迴圈；聊天模型與 Ollama 的實際可用性在對話時驗證。
+    """
+    ok = True
+    try:
+        from reranker import probe_availability
+
+        avail = probe_availability()
+        print(f"重排 CrossEncoder：{'可用' if avail.get('crossencoder') else '不可用'}", flush=True)
+        print(f"重排 LLM 備援：{'可用' if avail.get('llm') else '不可用'}", flush=True)
+        if not avail.get("crossencoder") and not avail.get("llm"):
+            ok = False
+    except Exception as e:
+        print(f"重排探測失敗：{e}", flush=True)
+        ok = False
+    try:
+        import rag_qdrant
+
+        collections = rag_qdrant._client().get_collections()
+        names = [getattr(c, "name", str(c)) for c in getattr(collections, "collections", [])]
+        url = rag_qdrant.get_config().url
+        print(f"Qdrant：可用（{url}，收藏集：{', '.join(names) if names else '無'}）", flush=True)
+    except Exception as e:
+        print(f"Qdrant：不可用（{e}）", flush=True)
+        ok = False
+    print(f"聊天模型：{model}（啟動後實際對話時驗證）", flush=True)
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> None:
     """主迴圈：不斷問「你說：」，再即時印出「小助理：」的串流回覆。」"""
     args = parse_args(argv)
@@ -171,6 +204,8 @@ def main(argv: list[str] | None = None) -> None:
         format="%(levelname)s %(name)s: %(message)s",
         force=True,
     )
+    if args.health:
+        raise SystemExit(_run_health_check(args.model))
     model = args.model
     search_g = not args.no_search
     # 優化：獨立會話狀態，不再共用全域；--no-history 用完即丟

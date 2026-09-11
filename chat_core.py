@@ -13,8 +13,9 @@
 
 【程式跑起來的三條路（chat_w 裡）】
 A. 日期路：短問句＋日期關鍵字 → 直接回今天日期。
-B. 工具路：讓模型選工具 → 查日期／查網頁 → 再串流回答。
-C. 傳統路：工具壞掉或關掉搜尋時走這裡，直接問模型，保證一定有話回你。
+B. 工具路：需要時先補一次搜尋 → 模型邊串流邊決定工具 →
+   沒叫工具的那一輪，串流內容就是最終答案（P15 起不再二次重生）。
+C. 傳統路：工具壞掉或關掉搜尋時走這裡，直接問模型（有本地筆記會附上）。
 """
 
 # --- 標準函式庫匯入 ---
@@ -102,7 +103,19 @@ def _sync_config() -> None:
         USER_MAX_CHARS = _m.USER_MAX_CHARS
         if OLLAMA_TIMEOUT != _m.OLLAMA_TIMEOUT:
             OLLAMA_TIMEOUT = _m.OLLAMA_TIMEOUT
-            _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
+            old = _ollama
+            try:
+                _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
+            except Exception as e:
+                _ollama = old  # 建不出新的就沿用舊的，別讓聊天斷炊
+                logger.warning("重建 Ollama client 失敗，沿用舊的：%s", e)
+            else:
+                # P15：與 rag_qdrant／reranker 同款生命週期管理，換新前先關舊
+                if old is not None:
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
     except Exception as e:
         logger.warning("配置同步失敗，沿用舊快照：%s", e)
 
@@ -343,6 +356,7 @@ def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[
 
     優化：第一參數吃 ChatState 或裸 list（測試抓出的易誤用點），list 視為要裁的緩衝。
     P11：字數與 token 任一超標即裁，中英混排不偏心。
+    P15：token 計算（較貴）移到鎖外快照上做，只有真正動刀時才進鎖。
     """
     first: ChatState | list[ChatMessage] | None = state
     if isinstance(first, list):
@@ -351,20 +365,30 @@ def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[
         st = _resolve_state(first)
         buf = target if target is not None else st.hist
     with _hist_lock:
-        while len(buf) > 2 * backtrace:
-            del buf[0:2]
-        # 優化：字數＋token 雙預算，避免長問答撐爆上下文
-        total_chars = sum(len(m.get("content", "")) for m in buf)
-        total_toks = sum(_content_tokens(str(m.get("content", "") or "")) for m in buf)
-        while buf and (total_chars > HIST_MAX_CHARS or total_toks > HIST_MAX_CHARS):
-            removed = buf.pop(0)
-            total_chars -= len(removed.get("content", ""))
-            total_toks -= _content_tokens(str(removed.get("content", "") or ""))
-            # 保持 user→assistant 成對：若剩奇數且開頭是 assistant 補撕一則
-            if len(buf) % 2 == 1 and buf and buf[0].get("role") == "assistant":
-                removed2 = buf.pop(0)
-                total_chars -= len(removed2.get("content", ""))
-                total_toks -= _content_tokens(str(removed2.get("content", "") or ""))
+        # 第一階段：組數上限，整組整組撕（快，進鎖一次到位）
+        excess = len(buf) - 2 * backtrace
+        if excess > 0:
+            del buf[:2 * ((excess + 1) // 2)]
+        # 快照：後續預算計算在鎖外跑，避免 tiktoken 佔著鎖
+        snapshot = list(buf)
+    total_chars = sum(len(m.get("content", "")) for m in snapshot)
+    total_toks = sum(_content_tokens(str(m.get("content", "") or "")) for m in snapshot)
+    drop = 0
+    n = len(snapshot)
+    while drop < n and (total_chars > HIST_MAX_CHARS or total_toks > HIST_MAX_CHARS):
+        removed = snapshot[drop]
+        total_chars -= len(removed.get("content", ""))
+        total_toks -= _content_tokens(str(removed.get("content", "") or ""))
+        drop += 1
+        # 保持 user→assistant 成對：若剩奇數且開頭是 assistant 補撕一則
+        if (n - drop) % 2 == 1 and drop < n and snapshot[drop].get("role") == "assistant":
+            removed2 = snapshot[drop]
+            total_chars -= len(removed2.get("content", ""))
+            total_toks -= _content_tokens(str(removed2.get("content", "") or ""))
+            drop += 1
+    if drop:
+        with _hist_lock:
+            del buf[:min(drop, len(buf))]
 
 
 def _remember(user_msg: str, assistant_msg: str, state: ChatState | None = None, target: list[ChatMessage] | None = None) -> None:
@@ -479,15 +503,18 @@ def get_last_rag(state: ChatState | None = None) -> list[dict[str, str]]:
     return list(_resolve_state(state).last_rag)
 
 
-def _maybe_llm_rewrite(query: str) -> str:
-    """可選 LLM 查詢改寫：QUERY_REWRITE_LLM 開了才多打一次，失敗回規則清洗版。」"""
+def _maybe_llm_rewrite(query: str, model: str | None = None) -> str:
+    """可選 LLM 查詢改寫：QUERY_REWRITE_LLM 開了才多打一次，失敗回規則清洗版。
+
+    P15：呼叫模型沿用本回合選定的 model（未指定才回預設），不再固定吃 config 預設。
+    """
     cleaned = _clean_query_for_search(query)
     if not QUERY_REWRITE_LLM:
         return cleaned or query.strip()[:SEARCH_QUERY_MAX_CHARS].strip()
     try:
         msg = _call_chat_with_retry(
             [{"role": "user", "content": f"把問題改寫成繁中檢索關鍵字，只回關鍵字不要解釋：{cleaned[:200]}"}],
-            _resolve_model(None),
+            _resolve_model(model),
             None,
         )
         raw = msg["message"] if isinstance(msg, dict) else _get_field(msg, "message")
@@ -498,8 +525,11 @@ def _maybe_llm_rewrite(query: str) -> str:
         return cleaned
 
 
-def _retrieve_rag(query: str, state: ChatState | None = None) -> list[dict[str, str]]:
-    """查本地筆記並記住結果；關閉開關、閒聊、空字串時直接回空。」"""
+def _retrieve_rag(query: str, state: ChatState | None = None, model: str | None = None) -> list[dict[str, str]]:
+    """查本地筆記並記住結果；關閉開關、閒聊、空字串時直接回空。
+
+    P15：model 供 `_maybe_llm_rewrite` 沿用本回合模型。
+    """
     st = _resolve_state(state)
     with _hist_lock:
         st.last_rag.clear()
@@ -508,7 +538,7 @@ def _retrieve_rag(query: str, state: ChatState | None = None) -> list[dict[str, 
     if _is_chitchat(query) or _is_date_query(query):
         return []
     try:
-        retrieval_query = _maybe_llm_rewrite(query)
+        retrieval_query = _maybe_llm_rewrite(query, model)
         hits = _rag_search(retrieval_query or query, limit=RAG_MAX_RESULTS)
     except Exception as e:  # BROAD_EXCEPT_OK - 嵌入／Qdrant 斷線降級為無命中
         logger.warning("本地檢索失敗，已降級為無命中：%s", e)
@@ -569,7 +599,14 @@ def _format_search_results(results: list[SearchResult]) -> str:
 
 def _extract_tool_calls(message: object) -> list[ToolCall]:
     """相容 dict 與物件兩種回傳，取出 (工具名, 參數)。"""
-    raw_calls = _get_field(message, "tool_calls")
+    return _extract_tool_calls_raw(_get_field(message, "tool_calls"))
+
+
+def _extract_tool_calls_raw(raw_calls: object) -> list[ToolCall]:
+    """把原始 tool_calls 清單正規化為 (工具名, 參數 dict)。
+
+    P15：串流累積的 tool_calls 與非串流的單一 message 共用同一套解析。
+    """
     if not raw_calls:
         return []
     calls: list[ToolCall] = []
@@ -600,15 +637,6 @@ def _assistant_text(message: object) -> str:
     """取出 assistant 文字，None 回空字串。」"""
     raw = _get_field(message, "content")
     return str(raw) if raw is not None else ""
-
-
-def _assistant_tool_message(message: object) -> ChatMessage:
-    """保留 tool_calls 的 assistant 訊息，保持 user→assistant→tool 順序。」"""
-    raw_calls = _get_field(message, "tool_calls")
-    msg: ChatMessage = {"role": "assistant", "content": _assistant_text(message)}
-    if isinstance(raw_calls, list) and raw_calls:
-        msg["tool_calls"] = list(raw_calls)
-    return msg
 
 
 def _run_tool(name: str, args: dict[str, object], user_msg: str, state: ChatState | None = None) -> str:
@@ -645,19 +673,23 @@ def _call_chat_with_retry(messages: list[ChatMessage], model: str, tools: list[d
     raise last_err
 
 
-def _stream_reply(messages: list[ChatMessage], model: str | None = None) -> Iterator[str]:
-    """串流取得 ollama 回覆片段，有文字才 yield。
+def _stream_chat(messages: list[ChatMessage], model: str, tools: list[dict[str, object]] | None = None, calls_out: list[object] | None = None) -> Iterator[str]:
+    """串流取得 ollama 回覆片段，有文字才 yield；有給 calls_out 時累積 tool_calls。
 
     優化：捕獲串流中斷（雲端模型網路不穩），已產生的片段仍保留、
     讓上層 _remember 正常記入歷史，不因中斷丟失整輪。
     P8 可觀測：記錄首字延遲，體感優化用。
+    P15：帶工具時同時把每個 chunk 的 tool_calls 累積到 calls_out，
+    讓「偵測工具」與「輸出答案」共用同一次生成。
     """
-    use_model = _resolve_model(model)
     t0 = time.perf_counter()
     stream = None
     for attempt in range(2):
         try:
-            stream = _ollama.chat(model=use_model, messages=messages, stream=True)
+            if tools is None:
+                stream = _ollama.chat(model=model, messages=messages, stream=True)
+            else:
+                stream = _ollama.chat(model=model, messages=messages, tools=tools, stream=True)
             break
         except Exception as e:  # BROAD_EXCEPT_OK - 建立串流失敗重試一次
             logger.warning("串流建立第 %d 次失敗（%s）", attempt + 1, e)
@@ -677,15 +709,24 @@ def _stream_reply(messages: list[ChatMessage], model: str | None = None) -> Iter
                 content = str(raw_content) if raw_content is not None else None
                 if content:
                     if first:
-                        logger.debug("觀測 首字延遲=%.1fms 模型=%s", (time.perf_counter() - t0) * 1000, use_model)
+                        logger.debug("觀測 首字延遲=%.1fms 模型=%s", (time.perf_counter() - t0) * 1000, model)
                         first = False
                     yield content
+                if calls_out is not None and message_obj is not None:
+                    raw_calls = _get_field(message_obj, "tool_calls")
+                    if isinstance(raw_calls, list):
+                        calls_out.extend(raw_calls)
             except Exception as e:  # BROAD_EXCEPT_OK - 單一 chunk 解析失敗，跳過不炸整輪
                 logger.warning("串流 chunk 解析失敗（%s），已跳過", e)
                 continue
     except Exception as e:  # BROAD_EXCEPT_OK - 串流中斷（雲端斷線），保留已生成片段
         logger.warning("串流中斷（%s），已保留已生成的片段", e)
         return
+
+
+def _stream_reply(messages: list[ChatMessage], model: str | None = None) -> Iterator[str]:
+    """純問答串流（不帶工具），委派給 `_stream_chat`。」"""
+    yield from _stream_chat(messages, _resolve_model(model))
 
 
 def _system_content(messages: list[ChatMessage], today: str) -> str:
@@ -730,27 +771,78 @@ def _tool_call_key(name: str, args: dict[str, object]) -> tuple:
         return (name, str(sorted(args.items())))
 
 
-def _run_tool_loop(base: list[ChatMessage], user_msg: str, use_model: str, state: ChatState | None = None) -> list[ChatMessage]:
-    """跑最多 MAX_TOOL_ROUNDS 輪工具呼叫，同名同參去重，回傳含工具結果的訊息串。」"""
+def _needs_pre_search(user_msg: str, rag_hits: list[dict[str, str]] | None, rag_block: str, state: ChatState | None = None) -> bool:
+    """是否需要在模型開跑前先補一次網路搜尋。
+
+    舊版是「等模型決定不查、且本地不夠」才補搜，但串流流程無法回頭；
+    P15 改成開跑前預判：本地筆記不夠力（或明確要即時資料且尚無來源）就先補。閒聊永不補搜。
+    """
+    if _is_chitchat(user_msg):
+        return False
+    st = _resolve_state(state)
+    local_adequate = _rag_adequate(rag_hits) if rag_hits is not None else bool(rag_block)
+    if not local_adequate:
+        return True
+    return _needs_realtime(user_msg) and not st.last_sources
+
+
+def _with_fresh_facts(base: list[ChatMessage], user_msg: str, today: str, rag_block: str, state: ChatState) -> list[ChatMessage]:
+    """把剛搜到的網頁事實＋本地筆記併進訊息串，供模型作答。"""
+    facts = _format_search_results(_search_web(user_msg, state=state))
+    parts = [f"今天是 {today}（台灣時間）。"]
+    if rag_block:
+        parts.append(rag_block)
+    parts.append(facts)
+    parts.append(f"使用者問題：{user_msg}")
+    content = "\n\n---\n\n".join(parts)
+    sys_with_date: ChatMessage = {"role": "system", "content": _system_content(base, today)}
+    return _with_history(sys_with_date, state, content)
+
+
+def _tool_flow(base: list[ChatMessage], user_msg: str, today: str, rag_block: str, use_model: str, state: ChatState | None = None, rag_hits: list[dict[str, str]] | None = None) -> Iterator[str]:
+    """串流工具流程：需要時先補搜 → 每輪邊串流邊偵測工具 → 直接完成。
+
+    P15：模型沒呼叫工具的那一輪，串流內容就是最終答案（舊版會丟掉再重生一次）；
+    只有真的要繼續呼叫工具，才把該輪 assistant 訊息與工具結果接進下一輪。
+    """
     st = _resolve_state(state)
     messages: list[ChatMessage] = list(base)
+    if _needs_pre_search(user_msg, rag_hits, rag_block, state=st):
+        messages = _with_fresh_facts(messages, user_msg, today, rag_block, st)
     seen: set[tuple] = set()
     for _ in range(MAX_TOOL_ROUNDS):
-        first = _call_chat_with_retry(messages, use_model, _tools())
-        msg_obj = first["message"] if isinstance(first, dict) else _get_field(first, "message")
-        calls = _extract_tool_calls(msg_obj)
+        calls_out: list[object] = []
+        parts: list[str] = []
+        for piece in _stream_chat(messages, use_model, tools=_tools(), calls_out=calls_out):
+            parts.append(piece)
+            yield piece
+        calls = _extract_tool_calls_raw(calls_out)
         if not calls:
-            break
-        # 過濾已執行過的同參呼叫，全重複直接停
-        fresh = [(n, a) for n, a in calls if _tool_call_key(n, a) not in seen]
+            _remember(user_msg, "".join(parts), state=st)
+            return
+        # 同名同參去重：同一輪重複只跑一次，跨輪重複也擋掉
+        fresh: list[ToolCall] = []
+        for name, args in calls:
+            key = _tool_call_key(name, args)
+            if key in seen:
+                continue
+            seen.add(key)
+            fresh.append((name, args))
         if not fresh:
-            logger.debug("觀測 工具呼叫全重複，已提早停止")
+            logger.debug("觀測 工具呼叫全重複，改以現有結果收尾")
             break
-        messages.append(_assistant_tool_message(msg_obj))
+        tool_msg: ChatMessage = {"role": "assistant", "content": "".join(parts)}
+        if calls_out:
+            tool_msg["tool_calls"] = list(calls_out)
+        messages.append(tool_msg)
         for tool_name, tool_args in fresh:
-            seen.add(_tool_call_key(tool_name, tool_args))
             messages.append({"role": "tool", "content": _run_tool(tool_name, tool_args, user_msg, state=st)})
-    return messages
+    # 回合用盡或全重複：最後一輪不帶工具，串流收尾
+    reply_full = ""
+    for piece in _stream_reply(messages, model=use_model):
+        reply_full += piece
+        yield piece
+    _remember(user_msg, reply_full, state=st)
 
 
 def _rag_threshold() -> float:
@@ -806,46 +898,16 @@ def _rag_adequate(hits: list[dict[str, str]] | None) -> bool:
     return True
 
 
-def _handle_tool_flow(messages: list[ChatMessage], user_msg: str, today: str, rag_block: str, use_model: str, state: ChatState | None = None, rag_hits: list[dict[str, str]] | None = None) -> Iterator[str]:
-    """工具流程收尾：必要時補傳統搜尋，再串流回傳。」
+def _handle_legacy_flow(sys_msg: str, user_msg: str, today: str, use_model: str, state: ChatState | None = None, rag_block: str = "") -> Iterator[str]:
+    """傳統降級流程：不做工具增強，直接問模型；有本地筆記（rag_block）時一併附上。
 
-    優化：RAG 已有命中（本地資料夠）時不再無條件補搜網；
-    只有 RAG 空手、或明確要求即時資料，才補一次網路搜尋。
+    P15：修正舊版 `--no-search` 檢索了筆記卻不餵給模型的浪費與來源顯示誤導。
     """
     st = _resolve_state(state)
-    # 是否有本機足夠依據：本地筆記有命中且分數過門檻，或問句本身不需外部事實（閒聊）
-    if rag_hits is not None:
-        local_adequate = _rag_adequate(rag_hits) or _is_chitchat(user_msg)
-    else:
-        local_adequate = bool(rag_block) or _is_chitchat(user_msg)
-    # 明確要求即時資料時，本地命中不足以取代網路，仍要補搜；
-    # P14：但工具迴圈若已搜過網（本回合 last_sources 有值），就不再重複搜一次
-    wants_realtime = _needs_realtime(user_msg)
-    realtime_needs_search = wants_realtime and not st.last_sources
-    needs_legacy_search = all(m.get("role") != "tool" for m in messages) and not local_adequate
-    if (needs_legacy_search or realtime_needs_search) and not _is_chitchat(user_msg):
-        facts = _format_search_results(_search_web(user_msg, state=st))
-        parts = [f"今天是 {today}（台灣時間）。"]
-        if rag_block:
-            parts.append(rag_block)
-        parts.append(facts)
-        parts.append(f"使用者問題：{user_msg}")
-        content = "\n\n---\n\n".join(parts)
-        sys_with_date: ChatMessage = {"role": "system", "content": _system_content(messages, today)}
-        messages = _with_history(sys_with_date, st, content)
-    reply_full = ""
-    for reply in _stream_reply(messages, model=use_model):
-        reply_full += reply
-        yield reply
-    _remember(user_msg, reply_full, state=st)
-
-
-def _handle_legacy_flow(sys_msg: str, user_msg: str, today: str, use_model: str, state: ChatState | None = None) -> Iterator[str]:
-    """傳統降級流程：不做工具增強，直接問模型。」"""
-    st = _resolve_state(state)
     sys_with_date = _make_system_msg(sys_msg, today)
+    content = f"{rag_block}\n\n---\n\n使用者問題：{user_msg}" if rag_block else user_msg
     reply_full = ""
-    for reply in _stream_reply(_with_history(sys_with_date, st, user_msg), model=use_model):
+    for reply in _stream_reply(_with_history(sys_with_date, st, content), model=use_model):
         reply_full += reply
         yield reply
     _remember(user_msg, reply_full, state=st)
@@ -882,23 +944,27 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
     # 本地筆記通常沒有新聞、股價、天氣等即時內容；先搜網更快且答案更新
     realtime = _needs_realtime(user_msg)  # P14：同一輪只算一次，日誌不再重複計算
     if realtime:
-        rag_hits = []
-        rag_ms = (time.perf_counter() - t0) * 1000
+        rag_hits: list[dict[str, str]] = []
     else:
-        rag_hits = _retrieve_rag(user_msg, state=st)
-        rag_ms = (time.perf_counter() - t0) * 1000
+        rag_hits = _retrieve_rag(user_msg, state=st, model=use_model)
+    rag_ms = (time.perf_counter() - t0) * 1000
     rag_block = _format_rag_results(rag_hits)
     base = _build_base_messages(sys_msg, user_msg, today, rag_block, state=st)
     logger.debug("觀測 rag_hits=%d rag_ms=%.1f realtime=%s", len(rag_hits), rag_ms, realtime)
     if search_g is True:
+        t1 = time.perf_counter()
+        pieces: list[str] = []
         try:
-            t1 = time.perf_counter()
-            messages = _run_tool_loop(base, user_msg, use_model, state=st)
-            tool_ms = (time.perf_counter() - t1) * 1000
-            logger.debug("觀測 tool_rounds=%d tool_ms=%.1f sources=%d", len([m for m in messages if m.get('role') == 'tool']), tool_ms, len(st.last_sources))
-            yield from _handle_tool_flow(messages, user_msg, today, rag_block, use_model, state=st, rag_hits=rag_hits)
-            return
-        except Exception as e:  # BROAD_EXCEPT_OK - 工具流程失敗降級為舊流程
+            for piece in _tool_flow(base, user_msg, today, rag_block, use_model, state=st, rag_hits=rag_hits):
+                pieces.append(piece)
+                yield piece
+        except Exception as e:  # BROAD_EXCEPT_OK - 工具流程失敗降級為傳統流程
+            if pieces:
+                _remember(user_msg, "".join(pieces), state=st)
+                logger.warning("工具流程中斷（已保留部分輸出）：%s", e)
+                return
             logger.warning("工具流程降級為傳統流程：%s", e)
-            pass
-    yield from _handle_legacy_flow(sys_msg, user_msg, today, use_model, state=st)
+        else:
+            logger.debug("觀測 tool_ms=%.1f sources=%d", (time.perf_counter() - t1) * 1000, len(st.last_sources))
+            return
+    yield from _handle_legacy_flow(sys_msg, user_msg, today, use_model, state=st, rag_block=rag_block)

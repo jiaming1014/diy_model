@@ -27,18 +27,22 @@ class TestTextLimit:
 
 class TestToolDedup:
     def test_same_call_runs_once(self) -> None:
-        tool_msg = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"function": {"name": "search_web", "arguments": '{"query": "同"}'}}],
-        }
-        fake_resp = {"message": tool_msg}
-        with mock.patch.object(chat_core, "_call_chat_with_retry", return_value=fake_resp):
+        """同一輪內同名同參重複出現，只執行一次（P15 串流工具輪版本）。"""
+        calls: list = []
+
+        def fake_chat(**kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                tc = {"function": {"name": "search_web", "arguments": '{"query": "同"}'}}
+                return iter([{"message": {"content": "", "tool_calls": [tc, dict(tc)]}}])
+            return iter([{"message": {"content": "done"}}])
+
+        with mock.patch.object(chat_core, "_retrieve_rag", return_value=[{"text": "x", "score": "0.9"}]):
             with mock.patch.object(chat_core, "_run_tool", return_value="結果") as m_tool:
-                with mock.patch.object(chat_core, "MAX_TOOL_ROUNDS", 2):
-                    out = chat_core._run_tool_loop([{"role": "user", "content": "hi"}], "hi", "m", state=chat_core.ChatState())
+                with mock.patch.object(chat_core._ollama, "chat", side_effect=fake_chat):
+                    out = list(chat_core.chat_w("sys", "問題", search_g=True, model="m", state=chat_core.ChatState()))
         assert m_tool.call_count == 1
-        assert sum(1 for m in out if m.get("role") == "tool") == 1
+        assert "done" in "".join(out)
 
     def test_key_stable(self) -> None:
         assert chat_core._tool_call_key("a", {"x": 1}) == chat_core._tool_call_key("a", {"x": 1})
