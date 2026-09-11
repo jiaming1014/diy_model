@@ -22,14 +22,12 @@ C. 傳統路：工具壞掉或關掉搜尋時走這裡，直接問模型（有�
 from collections.abc import Iterator  # 會一片一片回傳字串的串流函式｜新手：想成「會吐很多小紙條的機器」
 from collections.abc import Mapping  # dict 與唯讀映射的共同介面，取欄位時共用
 from dataclasses import dataclass, field  # 把相關狀態包成一包，取代散落的全域變數
-from datetime import datetime  # 取得現在時間（配合台灣時區算今天日期）
 from typing import Final, Literal, TypedDict  # Final：約好不改；Literal：限定字串；TypedDict：字典長相
 from typing import NotRequired  # TypedDict 中可有可無的鍵
-from zoneinfo import ZoneInfo  # ZoneInfo("Asia/Taipei") 取得台灣時間
+from typing import cast  # P16：裁切快照複本時保住 ChatMessage 型別
 import json  # 解析工具參數（arguments 可能是 JSON 字串）
 import logging  # 取代 print，讓降級訊息可分級、不污染串流輸出
 import random  # 重試抖動用，避免驚群
-import re  # 正則統一清標點，比多層 strip 更穩
 import threading  # 歷史紀錄加鎖，避免多執行緒同時改 hist 打架
 import time  # 重試退避睡眠用
 
@@ -52,6 +50,9 @@ from ttl_cache import TTLCache  # P14：共用 LRU＋TTL 快取，搜尋結果�
 
 # --- 全域常數設定（唯一真相在 config.py，這裡保留同名，對外寫法不變）---
 from config import HIST_MAX_CHARS as HIST_MAX_CHARS
+from config import HIST_SUMMARY_ENABLE as HIST_SUMMARY_ENABLE
+from config import HIST_SUMMARY_MAX_CHARS as HIST_SUMMARY_MAX_CHARS
+from config import HIST_SUMMARY_MIN_DROPPED as HIST_SUMMARY_MIN_DROPPED
 from config import MAX_TOOL_ROUNDS as MAX_TOOL_ROUNDS
 from config import OLLAMA_MODEL as OLLAMA_MODEL
 from config import OLLAMA_RETRIES as OLLAMA_RETRIES
@@ -63,10 +64,22 @@ from config import RAG_MAX_RESULTS as RAG_MAX_RESULTS
 from config import SEARCH_MAX_CHARS as SEARCH_MAX_CHARS
 from config import SEARCH_MAX_RESULTS as SEARCH_MAX_RESULTS
 from config import SEARCH_QUERY_MAX_CHARS as SEARCH_QUERY_MAX_CHARS
+from config import SEARCH_REGION as SEARCH_REGION
 from config import SEARCH_SNIPPET_CHARS as SEARCH_SNIPPET_CHARS
 from config import SEARCH_TITLE_CHARS as SEARCH_TITLE_CHARS
 from config import SEARCH_TIMEOUT as SEARCH_TIMEOUT
 from config import USER_MAX_CHARS as USER_MAX_CHARS
+
+# --- P16 模組化：純文字規則助手收斂到 text_utils.py，這裡同名重新匯出（舊寫法不變）---
+from text_utils import _clean_query_for_search as _clean_query_for_search
+from text_utils import _current_year as _current_year
+from text_utils import _is_chitchat as _is_chitchat
+from text_utils import _is_date_query as _is_date_query
+from text_utils import _needs_realtime as _needs_realtime
+from text_utils import _normalize_url as _normalize_url
+from text_utils import _strip_edge as _strip_edge
+from text_utils import _today_str as _today_str
+from text_utils import _truncate_user_msg as _truncate_user_msg
 
 # 優化：建立帶逾時的共用 client，避免 ollama.chat 等不到就永遠卡住
 _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
@@ -77,15 +90,19 @@ def _sync_config() -> None:
 
     保留 `from chat_core import X` 舊寫法相容，呼叫後舊別名也更新。
     """
-    global HIST_MAX_CHARS, MAX_TOOL_ROUNDS, OLLAMA_MODEL, OLLAMA_RETRIES
+    global HIST_MAX_CHARS, HIST_SUMMARY_ENABLE, HIST_SUMMARY_MAX_CHARS, HIST_SUMMARY_MIN_DROPPED
+    global MAX_TOOL_ROUNDS, OLLAMA_MODEL, OLLAMA_RETRIES
     global OLLAMA_TIMEOUT, QUERY_REWRITE_LLM, RAG_ENABLE, RAG_MAX_CHARS
     global RAG_MAX_RESULTS
-    global SEARCH_MAX_CHARS, SEARCH_MAX_RESULTS, SEARCH_QUERY_MAX_CHARS
+    global SEARCH_MAX_CHARS, SEARCH_MAX_RESULTS, SEARCH_QUERY_MAX_CHARS, SEARCH_REGION
     global SEARCH_SNIPPET_CHARS, SEARCH_TITLE_CHARS, SEARCH_TIMEOUT
     global USER_MAX_CHARS, _ollama
     try:
         _m = _config_module
         HIST_MAX_CHARS = _m.HIST_MAX_CHARS
+        HIST_SUMMARY_ENABLE = _m.HIST_SUMMARY_ENABLE
+        HIST_SUMMARY_MAX_CHARS = _m.HIST_SUMMARY_MAX_CHARS
+        HIST_SUMMARY_MIN_DROPPED = _m.HIST_SUMMARY_MIN_DROPPED
         MAX_TOOL_ROUNDS = _m.MAX_TOOL_ROUNDS
         OLLAMA_MODEL = _m.OLLAMA_MODEL
         OLLAMA_RETRIES = _m.OLLAMA_RETRIES
@@ -97,6 +114,7 @@ def _sync_config() -> None:
         SEARCH_MAX_CHARS = _m.SEARCH_MAX_CHARS
         SEARCH_MAX_RESULTS = _m.SEARCH_MAX_RESULTS
         SEARCH_QUERY_MAX_CHARS = _m.SEARCH_QUERY_MAX_CHARS
+        SEARCH_REGION = _m.SEARCH_REGION
         SEARCH_SNIPPET_CHARS = _m.SEARCH_SNIPPET_CHARS
         SEARCH_TITLE_CHARS = _m.SEARCH_TITLE_CHARS
         SEARCH_TIMEOUT = _m.SEARCH_TIMEOUT
@@ -146,6 +164,7 @@ class ChatState:
     hist: list[ChatMessage] = field(default_factory=list)
     last_sources: list[SearchResult] = field(default_factory=list)
     last_rag: list[dict[str, str]] = field(default_factory=list)
+    summary: str = ""  # P16：被裁掉的舊訊息壓縮成滾動摘要（HIST_SUMMARY_ENABLE 開啟才會有）
 
 
 # --- 對話記憶與規則關鍵字 ---
@@ -160,37 +179,7 @@ _SEARCH_CACHE: TTLCache[list[SearchResult]] = TTLCache(
     maxsize=_config_module.SEARCH_CACHE_MAX,
     ttl=_config_module.SEARCH_CACHE_TTL,
 )
-TAIPEI_TZ: Final[str] = "Asia/Taipei"
-_WEEKDAY_ZH: Final[tuple[str, ...]] = ("一", "二", "三", "四", "五", "六", "日")
-_DATE_KEYWORDS: Final[tuple[str, ...]] = (
-    "今天", "今日", "現在", "日期", "幾號", "星期", "禮拜", "時間", "幾點", "年月日",
-)
-_WEATHER_KEYWORDS: Final[tuple[str, ...]] = (
-    "天氣", "氣溫", "溫度", "下雨", "降雨", "降水", "颱風", "預報", "濕度", "晴", "多雲", "陰天",
-)
-_CHITCHAT: Final[frozenset[str]] = frozenset(
-    {"你好", "您好", "嗨", "嗨嗨", "哈囉", "早安", "午安", "晚安", "謝謝", "感謝",
-     "再見", "掰掰", "拜拜", "ok", "okay", "hi", "hello", "hey"}
-)
-# 優化：即時類關鍵字，問句含這些就直接上網搜，不花時間翻本地筆記
-# 本地筆記通常沒有這些；相反先搜網更快且答案更新
-# P0 修正：移除過寬的泛時間詞（2026／今年／現況等），避免「今年筆記在哪」被誤判跳過 RAG；
-# 年齡類改交給工具迴圈的 LLM 自行判斷，不再強制即時。
-_REALTIME_KEYWORDS: Final[tuple[str, ...]] = (
-    "新聞", "最新", "股價", "匯率", "比特幣", "加密貨幣", "天氣", "氣溫",
-    "颱風", "地震", "即時", "公告", "發布", "上市", "發表", "演出",
-    "票價", "賽事", "比分", "排名", "榜單",
-)
-# 本地意圖關鍵字：含這些優先視為查本地筆記，不強制即時（除非同時命中強即時詞）
-_LOCAL_KEYWORDS: Final[tuple[str, ...]] = (
-    "筆記", "專案", "資料夾", "嵌入", "收藏", "本地", "notes",
-)
-_STRIP_EDGE_RE: Final[re.Pattern[str]] = re.compile(r"^[\s，。！？、；：,.!?;:～~\-—]+|[\s，。！？、；：,.!?;:～~\-—]+$")
-
-
-def _current_year() -> str:
-    """工具描述用的年份，每年自動跟進，不再寫死 2025｜新手：菜單上的年份不用每年手改。」"""
-    return str(datetime.now(ZoneInfo(TAIPEI_TZ)).year)
+# --- P16 模組化：關鍵字清單與純文字助手搬到 text_utils.py，開頭以同名重新匯出 ---
 
 
 _tools_cache: dict[str, list[dict[str, object]]] = {}  # 優化：依年份快取，避免每次重建
@@ -257,65 +246,6 @@ def _resolve_model(model: str | None) -> str:
     return model or OLLAMA_MODEL
 
 
-def _today_str() -> str:
-    """回傳台灣時間今天，如 2026-09-07 星期日。」"""
-    now = datetime.now(ZoneInfo(TAIPEI_TZ))
-    weekday = _WEEKDAY_ZH[now.weekday()]
-    return f"{now:%Y-%m-%d} 星期{weekday}"
-
-
-def _strip_edge(text: str) -> str:
-    """去頭尾空白與中英標點，統一短句判斷的輸入。」"""
-    return _STRIP_EDGE_RE.sub("", text.strip())
-
-
-def _is_date_query(query: str) -> bool:
-    """短句＋含日期關鍵字才算查日期，避免長問句被誤判。」"""
-    text = _strip_edge(query)
-    if not text:
-        return False
-    # 去空白後再量長度，避免標點／空格撐大誤判
-    compact = re.sub(r"\s+", "", text)
-    if len(compact) > 30:
-        return False
-    if any(kw in text for kw in _WEATHER_KEYWORDS):
-        return False
-    return any(kw in text for kw in _DATE_KEYWORDS)
-
-
-def _is_chitchat(query: str) -> bool:
-    """問候、道謝、道別等無需事實的短句，不強制搜尋。」"""
-    text = _strip_edge(query).lower()
-    if not text:
-        return False
-    compact = re.sub(r"\s+", "", text)
-    if len(compact) > 20:
-        return False
-    # 含事實關鍵字不算閒聊，避免「你好請問天氣」被誤判跳過搜尋
-    if any(kw in text for kw in _WEATHER_KEYWORDS + _REALTIME_KEYWORDS + _DATE_KEYWORDS):
-        # 純問候才放行：完全等於問候詞才算
-        return text in _CHITCHAT
-    if text in _CHITCHAT:
-        return True
-    return any(text.startswith(w) and len(text) - len(w) <= 3 for w in _CHITCHAT if w)
-
-
-def _needs_realtime(query: str) -> bool:
-    """問句是否明確要求即時資料｜新手：新聞、股價、天氣這種直接上網，別翻筆記本。」"""
-    text = _strip_edge(query).lower()
-    if not text:
-        return False
-    # 與日期關鍵字隔離：只問「今天幾號」是日期捷徑，不算即時
-    if _is_date_query(query):
-        return False
-    if not any(kw in text for kw in _REALTIME_KEYWORDS):
-        return False
-    # 本地意圖優先：含筆記／專案等詞視為查本地，不強制即時，交給工具迴圈自行決定
-    if any(kw in text for kw in _LOCAL_KEYWORDS):
-        return False
-    return True
-
-
 def _get_field(message: object, key: str) -> object:
     """同時相容 Mapping（含 dict）與物件的欄位取值｜新手：不管哪種包裝紙都用同一把剪刀拆。」"""
     if isinstance(message, Mapping):
@@ -351,24 +281,62 @@ def _content_tokens(text: str) -> int:
         return len(text or "")
 
 
-def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[ChatMessage] | None = None) -> None:
+def _summarize_dropped(st: ChatState, dropped: list[ChatMessage], model: str | None = None) -> None:
+    """把被裁掉的舊訊息壓成滾動摘要（P16，HIST_SUMMARY_ENABLE 開啟才生效）。
+
+    失敗或內容太少就什麼都不做——舊行為是直接丟棄，維持不變；
+    摘要有上限字數，餵回系統訊息供長對話保留遠期記憶。
+    """
+    if not HIST_SUMMARY_ENABLE:
+        return
+    total_dropped = sum(len(str(m.get("content", "") or "")) for m in dropped)
+    if total_dropped < HIST_SUMMARY_MIN_DROPPED:
+        return
+    lines = [f"{m.get('role')}：{str(m.get('content', '') or '')[:400]}" for m in dropped]
+    prompt_parts = ["請用繁體中文把下列對話壓縮成精簡摘要，保留重要事實、人名、數字與結論，不要客套話，只輸出摘要本身。"]
+    prev = st.summary.strip()
+    if prev:
+        prompt_parts.append(f"（既有摘要，請合併更新：{prev}）")
+    prompt_parts.append("對話內容：\n" + "\n".join(lines))
+    try:
+        msg = _call_chat_with_retry([{"role": "user", "content": "\n".join(prompt_parts)}], _resolve_model(model), None)
+        raw = msg["message"] if isinstance(msg, dict) else _get_field(msg, "message")
+        text = _assistant_text(raw).strip()
+    except Exception as e:  # BROAD_EXCEPT_OK - 摘要失敗不可影響對話
+        logger.warning("歷史摘要失敗，裁掉內容照舊丟棄：%s", e)
+        return
+    if not text:
+        return
+    if len(text) > HIST_SUMMARY_MAX_CHARS:
+        text = text[:HIST_SUMMARY_MAX_CHARS] + "…"
+    st.summary = text
+    logger.debug("觀測 歷史摘要更新（%d 字，來源 %d 則）", len(text), len(dropped))
+
+
+def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[ChatMessage] | None = None, model: str | None = None) -> None:
     """裁歷史：先按組數裁，再按字數＋token 雙預算從舊裁｜新手：小抄太厚先撕整頁，還是厚就撕舊的字。
 
     優化：第一參數吃 ChatState 或裸 list（測試抓出的易誤用點），list 視為要裁的緩衝。
     P11：字數與 token 任一超標即裁，中英混排不偏心。
     P15：token 計算（較貴）移到鎖外快照上做，只有真正動刀時才進鎖。
+    P16：HIST_SUMMARY_ENABLE 開啟時，被裁掉的舊訊息先壓成滾動摘要才丟。
     """
     first: ChatState | list[ChatMessage] | None = state
+    st_resolved: ChatState | None
     if isinstance(first, list):
         buf = first  # 直接傳 list：就裁它
+        st_resolved = None
     else:
-        st = _resolve_state(first)
-        buf = target if target is not None else st.hist
+        st_resolved = _resolve_state(first)
+        buf = target if target is not None else st_resolved.hist
+    dropped: list[ChatMessage] = []
     with _hist_lock:
         # 第一階段：組數上限，整組整組撕（快，進鎖一次到位）
         excess = len(buf) - 2 * backtrace
         if excess > 0:
-            del buf[:2 * ((excess + 1) // 2)]
+            n_del = 2 * ((excess + 1) // 2)
+            dropped.extend(cast(ChatMessage, dict(m)) for m in buf[:n_del])
+            del buf[:n_del]
         # 快照：後續預算計算在鎖外跑，避免 tiktoken 佔著鎖
         snapshot = list(buf)
     total_chars = sum(len(m.get("content", "")) for m in snapshot)
@@ -387,18 +355,21 @@ def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[
             total_toks -= _content_tokens(str(removed2.get("content", "") or ""))
             drop += 1
     if drop:
+        dropped.extend(cast(ChatMessage, dict(m)) for m in snapshot[:drop])
         with _hist_lock:
             del buf[:min(drop, len(buf))]
+    if st_resolved is not None and dropped:
+        _summarize_dropped(st_resolved, dropped, model)
 
 
-def _remember(user_msg: str, assistant_msg: str, state: ChatState | None = None, target: list[ChatMessage] | None = None) -> None:
-    """把一組問答記入指定狀態，預設寫全域相容別名。」"""
+def _remember(user_msg: str, assistant_msg: str, state: ChatState | None = None, target: list[ChatMessage] | None = None, model: str | None = None) -> None:
+    """把一組問答記入指定狀態，預設寫全域相容別名；P16：裁歷史時可帶 model 供摘要使用。」"""
     st = _resolve_state(state)
     buf = target if target is not None else st.hist
     with _hist_lock:
         buf.append({"role": "user", "content": user_msg})
         buf.append({"role": "assistant", "content": assistant_msg})
-    _trim_hist(st, buf)
+    _trim_hist(st, buf, model)
 
 
 def _cache_get(key: str) -> list[SearchResult] | None:
@@ -412,32 +383,7 @@ def _cache_put(key: str, value: list[SearchResult]) -> None:
     _SEARCH_CACHE.put(key, list(value))
 
 
-def _truncate_user_msg(msg: str) -> str:
-    """使用者輸入截斷防爆：超 USER_MAX_CHARS 留頭＋註記，避免單輪撐爆上下文。」"""
-    text = msg.strip() if isinstance(msg, str) else str(msg or "")
-    if len(text) <= USER_MAX_CHARS:
-        return text
-    return text[:USER_MAX_CHARS] + "…（過長已截斷）"
-
-
-_QUERY_FILLER_RE: Final[re.Pattern[str]] = re.compile(
-    r"^(請問|請問一下|幫我查一下|幫我找一下|查一下|找一下|謝謝|麻煩)[，,。\s]*|[？?！!啊呢吧喔哦]+$"
-)
-
-
-def _clean_query_for_search(query: str) -> str:
-    """規則式查詢清洗：去口語填充詞＋壓空白＋截斷，提高快取命中與檢索召回。」"""
-    text = _strip_edge(query.strip() if isinstance(query, str) else str(query or ""))
-    text = _QUERY_FILLER_RE.sub("", text).strip()
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:SEARCH_QUERY_MAX_CHARS].strip()
-
-
-def _normalize_url(url: str) -> str:
-    """URL 去重鍵：小寫＋去尾斜線＋去追蹤參數。」"""
-    u = (url or "").strip().lower()
-    u = re.sub(r"[?#].*$", "", u).rstrip("/")
-    return u
+# P16：_truncate_user_msg／_clean_query_for_search／_normalize_url 已搬至 text_utils.py（同名重新匯出）
 
 
 def _search_web(query: str, max_results: int | None = None, state: ChatState | None = None) -> list[SearchResult]:
@@ -452,7 +398,8 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
     short_query = _clean_query_for_search(query)
     if not short_query:
         return []
-    cached = _cache_get(short_query)
+    cache_key = f"{max_results}::{short_query}"  # P16：不同筆數不共用同一格快取
+    cached = _cache_get(cache_key)
     if cached is not None:
         with _hist_lock:
             st.last_sources.extend(cached)
@@ -465,7 +412,7 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
             except TypeError:
                 ddgs_ctx = DDGS()
             with ddgs_ctx as ddgs:
-                raw = list(ddgs.text(short_query, region="tw-twn", max_results=max_results))
+                raw = list(ddgs.text(short_query, region=SEARCH_REGION, max_results=max_results))
             break
         except Exception as e:  # BROAD_EXCEPT_OK - httpx 錯誤型別不一，邊界統一降級
             logger.warning("網頁搜尋第 %d 次失敗：%s", attempt + 1, e)
@@ -489,7 +436,7 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
         results.append({"title": title, "snippet": snippet, "url": url})
     with _hist_lock:
         st.last_sources.extend(results)
-    _cache_put(short_query, results)
+    _cache_put(cache_key, results)
     return results
 
 
@@ -748,9 +695,13 @@ def _make_system_msg(sys_msg: str, today: str) -> ChatMessage:
 
 
 def _with_history(sys_msg: ChatMessage, state: ChatState, user_content: str) -> list[ChatMessage]:
-    """系統＋歷史快照＋本次問題，歷史讀取加鎖複本。」"""
+    """系統＋歷史快照＋本次問題，歷史讀取加鎖複本；P16：有滾動摘要時附在系統訊息後。」"""
     with _hist_lock:
         hist_copy = list(state.hist)
+        summary = state.summary
+    if summary:
+        base = str(sys_msg.get("content", "") or "")
+        sys_msg = {"role": "system", "content": f"{base}\n（先前對話摘要：{summary}）"}
     return [sys_msg] + hist_copy + [{"role": "user", "content": user_content}]
 
 
@@ -787,12 +738,18 @@ def _needs_pre_search(user_msg: str, rag_hits: list[dict[str, str]] | None, rag_
 
 
 def _with_fresh_facts(base: list[ChatMessage], user_msg: str, today: str, rag_block: str, state: ChatState) -> list[ChatMessage]:
-    """把剛搜到的網頁事實＋本地筆記併進訊息串，供模型作答。"""
-    facts = _format_search_results(_search_web(user_msg, state=state))
+    """把剛搜到的網頁事實＋本地筆記併進訊息串，供模型作答。
+
+    P16：有搜到結果時附一句提示，降低模型再重複搜尋同一問題的機率。
+    """
+    results = _search_web(user_msg, state=state)
+    facts = _format_search_results(results)
     parts = [f"今天是 {today}（台灣時間）。"]
     if rag_block:
         parts.append(rag_block)
     parts.append(facts)
+    if results:
+        parts.append("（以上為最新搜尋結果，足夠時請直接作答，不需重複搜尋。）")
     parts.append(f"使用者問題：{user_msg}")
     content = "\n\n---\n\n".join(parts)
     sys_with_date: ChatMessage = {"role": "system", "content": _system_content(base, today)}
@@ -818,7 +775,7 @@ def _tool_flow(base: list[ChatMessage], user_msg: str, today: str, rag_block: st
             yield piece
         calls = _extract_tool_calls_raw(calls_out)
         if not calls:
-            _remember(user_msg, "".join(parts), state=st)
+            _remember(user_msg, "".join(parts), state=st, model=use_model)
             return
         # 同名同參去重：同一輪重複只跑一次，跨輪重複也擋掉
         fresh: list[ToolCall] = []
@@ -842,7 +799,7 @@ def _tool_flow(base: list[ChatMessage], user_msg: str, today: str, rag_block: st
     for piece in _stream_reply(messages, model=use_model):
         reply_full += piece
         yield piece
-    _remember(user_msg, reply_full, state=st)
+    _remember(user_msg, reply_full, state=st, model=use_model)
 
 
 def _rag_threshold() -> float:
@@ -910,7 +867,7 @@ def _handle_legacy_flow(sys_msg: str, user_msg: str, today: str, use_model: str,
     for reply in _stream_reply(_with_history(sys_with_date, st, content), model=use_model):
         reply_full += reply
         yield reply
-    _remember(user_msg, reply_full, state=st)
+    _remember(user_msg, reply_full, state=st, model=use_model)
 
 
 def _handle_date_query(user_msg: str, state: ChatState | None = None) -> str:
@@ -938,7 +895,7 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
         yield _handle_date_query(user_msg, state=st)
         return
     today = _today_str()
-    _trim_hist(st)
+    _trim_hist(st, model=use_model)
     t0 = time.perf_counter()
     # 優化：明確要求即時資料的問句，跳過本地筆記檢索（RAG + reranker），直接進工具／搜尋流程
     # 本地筆記通常沒有新聞、股價、天氣等即時內容；先搜網更快且答案更新
@@ -960,7 +917,7 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
                 yield piece
         except Exception as e:  # BROAD_EXCEPT_OK - 工具流程失敗降級為傳統流程
             if pieces:
-                _remember(user_msg, "".join(pieces), state=st)
+                _remember(user_msg, "".join(pieces), state=st, model=use_model)
                 logger.warning("工具流程中斷（已保留部分輸出）：%s", e)
                 return
             logger.warning("工具流程降級為傳統流程：%s", e)

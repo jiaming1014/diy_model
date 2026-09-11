@@ -2,6 +2,7 @@
 name = "diy-model"
 version = "0.1.0"
 description = "Ollama 本地聊天＋RAG（Qdrant）新手教學專案"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "ollama==0.6.2",

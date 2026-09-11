@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -198,6 +199,12 @@ def _run_health_check(model: str) -> int:
 def main(argv: list[str] | None = None) -> None:
     """主迴圈：不斷問「你說：」，再即時印出「小助理：」的串流回覆。」"""
     args = parse_args(argv)
+    # P16：Windows 主控台／管線輸出統一走 UTF-8，避免中文變亂碼
+    if sys.stdout is not None:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - 執行期才有
+        except Exception:
+            pass
     # 優化：force=True 讓重複 basicConfig 生效，避免第二入口的設定被吃掉
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,

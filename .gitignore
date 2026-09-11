@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ingest_cache.json
 .DIY_HIST_FILE*
 .diy_model_hist.json

@@ -45,6 +45,7 @@ class RAGConfig:
 
     url: str = _config.QDRANT_URL
     collection: str = _config.QDRANT_COLLECTION
+    api_key: str = _config.QDRANT_API_KEY  # P16：需驗證的 Qdrant（如 Cloud）用
     embed_model: str = _config.EMBED_MODEL
     vision_model: str = _config.VISION_MODEL
     timeout: float = _config.OLLAMA_TIMEOUT
@@ -79,6 +80,7 @@ def _sync_config() -> None:
         _CONFIG = RAGConfig(
             url=_config.QDRANT_URL,
             collection=_config.QDRANT_COLLECTION,
+            api_key=_config.QDRANT_API_KEY,
             embed_model=_config.EMBED_MODEL,
             vision_model=_config.VISION_MODEL,
             timeout=_config.OLLAMA_TIMEOUT,
@@ -145,7 +147,7 @@ IMAGE_SUFFIXES: set[str] = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 _client_lock = threading.Lock()
 _cached_client: QdrantClient | None = None
-_cached_url = ""
+_cached_key: tuple[str, str] | None = None  # (url, api_key)，P16：任一變了就換連線
 
 # P14：問題向量快取改用共用 TTLCache，同一問句重複檢索不再重新嵌入
 _QUERY_VEC_CACHE: TTLCache[list[float]] = TTLCache(
@@ -169,18 +171,22 @@ def _embed_query_vec(query: str) -> list[float] | None:
 
 def _client() -> QdrantClient:
     """Qdrant 單例連線｜新手：電話打一次就留著，別每次都重撥。」"""
-    global _cached_client, _cached_url
+    global _cached_client, _cached_key
     url = _CONFIG.url  # 優化：唯一真相走 _CONFIG，避免與相容快照漂移
+    key = (url, _CONFIG.api_key)  # P16：url 或 api_key 變了就換連線
     with _client_lock:
-        if _cached_client is not None and _cached_url == url:
+        if _cached_client is not None and _cached_key == key:
             return _cached_client
         if _cached_client is not None:
             try:
                 _cached_client.close()
             except Exception:
                 pass
-        _cached_client = QdrantClient(url=url)
-        _cached_url = url
+        if key[1]:
+            _cached_client = QdrantClient(url=key[0], api_key=key[1])
+        else:
+            _cached_client = QdrantClient(url=key[0])
+        _cached_key = key
         return _cached_client
 
 
@@ -753,12 +759,16 @@ def main() -> None:
     ap.add_argument("--query", default="", help="測試查詢，例如 '台北天氣如何'")
     ap.add_argument("--limit", type=int, default=3, help="查詢取幾塊")
     ap.add_argument("--quiet", action="store_true", help="只顯示警告與查詢結果，不顯示進度")
+    ap.add_argument("--progress", action="store_true", help="匯入時逐檔顯示進度（P16）")
     ap.add_argument("--verbose", action="store_true", help="顯示除錯訊息")
     args = ap.parse_args()
     level = logging.WARNING if args.quiet else (logging.DEBUG if args.verbose else logging.INFO)
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s", force=True)
     if args.ingest:
-        ingest_folder(args.ingest)
+        def _on_progress(done: int, total: int, rel: str) -> None:
+            print(f"[{done}/{total}] {rel}", flush=True)
+
+        ingest_folder(args.ingest, on_progress=_on_progress if args.progress else None)
     elif args.query:
         hits = search_local(args.query, limit=args.limit)
         if not hits:
