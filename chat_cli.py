@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from chat_core import OLLAMA_MODEL as _DEFAULT_MODEL
@@ -30,7 +31,7 @@ sys_msg = '請透過所提供的資料回答使用者問題，並一律使用繁
 MODEL = _DEFAULT_MODEL
 _QUIT_CMDS = {"q", "quit", "exit", "離開", "結束", "掰掰", "再見"}
 _DEFAULT_HIST = Path.home() / ".diy_model_hist.json"  # 相容快照，運行請走 _hist_path()
-_hist_lock = __import__("threading").Lock()  # 存檔鎖，同進程多執行緒不互踩
+_hist_lock = threading.Lock()  # 存檔鎖，同進程多執行緒不互踩
 
 
 def _hist_path() -> Path:

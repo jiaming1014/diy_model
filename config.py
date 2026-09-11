@@ -45,6 +45,7 @@ def _threshold_env(name: str) -> float:
     try:
         v = float(str(os.getenv(name, "")).strip() or "nan")
     except ValueError:
+        logger.warning("環境變數 %s 解析失敗，視為不設限", name)
         return float("-inf")
     if v != v:  # nan 表示未設
         return float("-inf")

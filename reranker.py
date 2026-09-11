@@ -43,13 +43,16 @@ logger = logging.getLogger(__name__)
 
 
 def _sync_config() -> None:
-    """P10 即時同步：重讀 config 真相，模型名變了清掉舊 CrossEncoder。」"""
+    """P10 即時同步：重讀 config 真相，模型名變了清掉舊 CrossEncoder。
+
+    P14：ollama client 只在逾時真的變了才丟棄（舊版每次呼叫都清成 None，
+    等於每次重排都重建），換掉前先關舊連線。
+    """
     global _ollama_timeout, RERANK_BACKEND, RERANK_BATCH, RERANK_ENABLE
     global RERANK_LLM_MODEL, RERANK_MODEL, RERANK_SNIPPET_CHARS, RERANK_THRESHOLD
-    global _cross_model, _cross_model_name, _ollama
+    global _cross_model, _cross_model_name, _ollama, _ollama_timeout_used
     try:
         _m = _config_module
-        _ollama_timeout = _m.OLLAMA_TIMEOUT
         RERANK_BACKEND = _m.RERANK_BACKEND
         RERANK_BATCH = _m.RERANK_BATCH
         RERANK_ENABLE = _m.RERANK_ENABLE
@@ -60,12 +63,18 @@ def _sync_config() -> None:
             RERANK_MODEL = _m.RERANK_MODEL
             _cross_model = None
             _cross_model_name = ""
-        # ollama 超時變了則重建，下次 _get_ollama 會用新逾時
-        if _ollama is not None:
-            try:
-                _ollama = None
-            except Exception:
-                pass
+        # ollama 超時真的變了才重建，下次 _get_ollama 會用新逾時
+        new_timeout = _m.OLLAMA_TIMEOUT
+        if _ollama_timeout_used != new_timeout:
+            _ollama_timeout_used = new_timeout
+            old = _ollama
+            _ollama = None
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+        _ollama_timeout = new_timeout
     except Exception as e:
         logger.warning("重排配置同步失敗，沿用舊快照：%s", e)
 
@@ -75,6 +84,7 @@ _cross_lock = threading.Lock()
 
 # 優化：延遲建立帶逾時的 ollama client（避免缺套件時 import 就炸）
 _ollama = None
+_ollama_timeout_used: float = _ollama_timeout  # P14：記住上次建立 client 用的逾時
 
 
 def _get_ollama():
@@ -85,7 +95,7 @@ def _get_ollama():
     try:
         import ollama
         _ollama = ollama.Client(timeout=_ollama_timeout)
-    except Exception:  # noqa: BROAD_EXCEPT_OK - 缺套件時回 None，交由上層降級
+    except Exception:  # BROAD_EXCEPT_OK - 缺套件時回 None，交由上層降級
         _ollama = None
     return _ollama
 
@@ -104,7 +114,7 @@ def _apply_threshold(docs: list[dict[str, str]]) -> list[dict[str, str]]:
     try:
         if RERANK_THRESHOLD == float("-inf"):
             return docs
-    except Exception:  # noqa: BROAD_EXCEPT_OK - 分數缺失時不擋路
+    except Exception:  # BROAD_EXCEPT_OK - 分數缺失時不擋路
         return docs
     kept = []
     for d in docs:

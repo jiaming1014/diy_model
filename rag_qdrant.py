@@ -18,7 +18,6 @@
 - 測試查詢：python rag_qdrant.py --query "台北天氣如何"
 """
 
-from collections import OrderedDict
 from dataclasses import dataclass
 import argparse
 import csv
@@ -26,7 +25,6 @@ import hashlib
 import json
 import logging
 import re
-import time
 from pathlib import Path
 import threading
 
@@ -36,6 +34,7 @@ from qdrant_client.http.models import Distance, PointStruct, VectorParams
 
 # 設定唯一真相在 config.py，這裡保留 RAGConfig 介面（欄位名不變）
 import config as _config
+from ttl_cache import TTLCache  # P14：共用 LRU＋TTL 快取，查詢向量快取用
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +65,16 @@ _CONFIG = RAGConfig()
 
 # 優化：建立帶逾時的共用 client，避免 ollama.embed/chat 卡死
 _ollama = ollama.Client(timeout=_CONFIG.timeout)
+_ollama_timeout_used: float = _CONFIG.timeout  # P14：記住目前 client 用的逾時，沒變就不重建
 
 
 def _sync_config() -> None:
-    """P10 即時同步：重建 _CONFIG 與快取上限，免重啟生效。」"""
-    global _CONFIG, _QUERY_VEC_CACHE_MAX, _QUERY_VEC_CACHE_TTL, _ollama
+    """P10 即時同步：重建 _CONFIG 與快取上限，免重啟生效。
+
+    P14：ollama client 只在逾時真的變了才重建（舊版條件恆真，每次查詢都換一顆 client），
+    換新前先關舊的，避免連線池漏掉。
+    """
+    global _CONFIG, _ollama, _ollama_timeout_used
     try:
         _CONFIG = RAGConfig(
             url=_config.QDRANT_URL,
@@ -90,13 +94,20 @@ def _sync_config() -> None:
             text_max_chars=_config.INGEST_TEXT_MAX_CHARS,
             docx_max_paras=_config.INGEST_DOCX_MAX_PARAS,
         )
-        _QUERY_VEC_CACHE_MAX = _config.QUERY_VEC_CACHE_MAX
-        _QUERY_VEC_CACHE_TTL = _config.QUERY_VEC_CACHE_TTL
-        if getattr(_ollama, "_timeout", None) != _CONFIG.timeout:
+        _QUERY_VEC_CACHE.update_limits(_config.QUERY_VEC_CACHE_MAX, _config.QUERY_VEC_CACHE_TTL)
+        if _ollama_timeout_used != _CONFIG.timeout:
+            old = _ollama
             try:
                 _ollama = ollama.Client(timeout=_CONFIG.timeout)
+                _ollama_timeout_used = _CONFIG.timeout
             except Exception:
-                pass
+                _ollama = old  # 建不出新的就沿用舊的，別讓嵌入斷炊
+            else:
+                if old is not None:
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
     except Exception as e:
         logger.warning("RAG 配置同步失敗，沿用舊快照：%s", e)
 
@@ -117,7 +128,7 @@ RERANK_RECALL: int = _CONFIG.rerank_recall
 
 try:
     from reranker import rerank as _rerank
-except Exception as _e:  # noqa: BROAD_EXCEPT_OK - reranker 缺失時仍要能純向量檢索
+except Exception as _e:  # BROAD_EXCEPT_OK - reranker 缺失時仍要能純向量檢索
     logger.warning("reranker 載入失敗（%s），降級為純向量排序", _e)
 
     def _rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[str, str]]:
@@ -136,43 +147,23 @@ _client_lock = threading.Lock()
 _cached_client: QdrantClient | None = None
 _cached_url = ""
 
-# 優化：問題向量快取，真 LRU＋TTL，同一問句重複檢索不再重新嵌入
-_query_vec_cache: OrderedDict[str, list[float]] = OrderedDict()
-_query_vec_cache_time: OrderedDict[str, float] = OrderedDict()
-_query_vec_cache_lock = threading.Lock()
-_QUERY_VEC_CACHE_MAX: int = _config.QUERY_VEC_CACHE_MAX
-_QUERY_VEC_CACHE_TTL: float = _config.QUERY_VEC_CACHE_TTL
+# P14：問題向量快取改用共用 TTLCache，同一問句重複檢索不再重新嵌入
+_QUERY_VEC_CACHE: TTLCache[list[float]] = TTLCache(
+    maxsize=_config.QUERY_VEC_CACHE_MAX,
+    ttl=_config.QUERY_VEC_CACHE_TTL,
+)
 
 
 def _embed_query_vec(query: str) -> list[float] | None:
-    """問題轉向量，真 LRU＋TTL：命中刷新順序，過期重算。」"""
-    now = time.monotonic()
-    with _query_vec_cache_lock:
-        hit = _query_vec_cache.get(query)
-        if hit is not None:
-            if now - _query_vec_cache_time.get(query, 0.0) <= _QUERY_VEC_CACHE_TTL:
-                _query_vec_cache.move_to_end(query)
-                _query_vec_cache_time.move_to_end(query)
-                return list(hit)
-            _query_vec_cache.pop(query, None)
-            _query_vec_cache_time.pop(query, None)
+    """問題轉向量，走共用 TTL 快取：命中回複本，過期重算。」"""
+    hit = _QUERY_VEC_CACHE.get(query)
+    if hit is not None:
+        return list(hit)
     vecs = _embed_texts([query])
     if not vecs:
         return None
     vec = vecs[0]
-    with _query_vec_cache_lock:
-        # 先清過期再寫入
-        expired = [k for k, t in _query_vec_cache_time.items() if now - t > _QUERY_VEC_CACHE_TTL]
-        for k in expired:
-            _query_vec_cache.pop(k, None)
-            _query_vec_cache_time.pop(k, None)
-        _query_vec_cache[query] = vec
-        _query_vec_cache_time[query] = now
-        _query_vec_cache.move_to_end(query)
-        _query_vec_cache_time.move_to_end(query)
-        while len(_query_vec_cache) > _QUERY_VEC_CACHE_MAX:
-            oldest, _ = _query_vec_cache.popitem(last=False)
-            _query_vec_cache_time.pop(oldest, None)
+    _QUERY_VEC_CACHE.put(query, vec)
     return vec
 
 
@@ -265,6 +256,9 @@ def _chunk_text(text: str, chunk_chars: int | None = None, overlap: int | None =
     cc = chunk_chars if chunk_chars is not None else _CONFIG.chunk_chars
     ov = overlap if overlap is not None else _CONFIG.chunk_overlap
     ct = chunk_tokens if chunk_tokens is not None else _CONFIG.chunk_max_tokens
+    # P14 防呆：重疊吃掉幾乎整塊時，切塊會原地打轉（無限迴圈），一律夾到「至少留 2 字前進」
+    cc = max(1, int(cc))
+    ov = min(max(0, int(ov)), max(0, cc - 2))
     clean = text.strip()
     if not clean:
         return []
@@ -297,7 +291,8 @@ def _chunk_text(text: str, chunk_chars: int | None = None, overlap: int | None =
                     room = cc - len(buf) - 1 if buf else cc
                     if room <= 0:
                         chunks.append(buf.strip())
-                        buf = _overlap_tail(buf, ov)
+                        # 極端設定保險：強制縮短 buf 一個字，保證往前推進不卡死
+                        buf = buf[1:].strip() if len(buf) > 1 else ""
                         continue
                     chunks.append(((buf + " " + sent[:room]).strip()) if buf else sent[:room].strip())
                     sent = sent[room:]

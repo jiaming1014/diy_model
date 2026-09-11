@@ -54,26 +54,22 @@ class TestSearchDedup:
         with mock.patch.object(chat_core, "DDGS") as m_ddgs:
             inst = m_ddgs.return_value.__enter__.return_value
             inst.text.return_value = raw
-            chat_core._search_cache.clear()
-            chat_core._search_cache_time.clear()
+            chat_core._SEARCH_CACHE.clear()
             out = chat_core._search_web("去重測試P3", state=ChatState())
         assert len(out) == 2
         assert out[0]["url"] == "https://example.com/a?utm=1"
-        chat_core._search_cache.clear()
-        chat_core._search_cache_time.clear()
+        chat_core._SEARCH_CACHE.clear()
 
     def test_snippet_truncated(self) -> None:
         raw = [{"title": "t" * 500, "body": "s" * 2000, "href": "https://example.com/c"}]
         with mock.patch.object(chat_core, "DDGS") as m_ddgs:
             inst = m_ddgs.return_value.__enter__.return_value
             inst.text.return_value = raw
-            chat_core._search_cache.clear()
-            chat_core._search_cache_time.clear()
+            chat_core._SEARCH_CACHE.clear()
             out = chat_core._search_web("截斷測試P3", state=ChatState())
         assert len(out[0]["title"]) <= chat_core.SEARCH_TITLE_CHARS
         assert len(out[0]["snippet"]) <= chat_core.SEARCH_SNIPPET_CHARS
-        chat_core._search_cache.clear()
-        chat_core._search_cache_time.clear()
+        chat_core._SEARCH_CACHE.clear()
 
 
 class TestSearchBudget:
@@ -96,15 +92,13 @@ class TestQueryVecTTL:
     def test_hit_returns_copy_and_lru(self) -> None:
         import rag_qdrant as rq
 
-        rq._query_vec_cache.clear()
-        rq._query_vec_cache_time.clear()
+        rq._QUERY_VEC_CACHE.clear()
         with mock.patch.object(rq, "_embed_texts", return_value=[[0.1, 0.2]]) as m:
             v1 = rq._embed_query_vec("ttl測試")
             v2 = rq._embed_query_vec("ttl測試")
             assert v1 == v2
             assert m.call_count == 1
-        rq._query_vec_cache.clear()
-        rq._query_vec_cache_time.clear()
+        rq._QUERY_VEC_CACHE.clear()
 
 
 class TestConfigRefresh:

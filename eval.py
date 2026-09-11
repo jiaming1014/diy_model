@@ -17,6 +17,7 @@
 
 import argparse
 import logging
+import re
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - Windows 下重設 stdout 編碼
@@ -105,9 +106,7 @@ def _eval_retrieval(case: dict) -> dict:
 
 def _has_citation(reply: str) -> bool:
     """回覆有無引用標註 [來源i]／[筆記i]，純函式好測試。」"""
-    import re as _re
-
-    return bool(_re.search(r"[(［\[] *(來源|筆記) *\d+ *[)］\]]", reply))
+    return bool(re.search(r"[(［\[] *(來源|筆記) *\d+ *[)］\]]", reply))
 
 
 def _eval_model(case: dict, model: str) -> dict:

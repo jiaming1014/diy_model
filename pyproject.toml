@@ -24,7 +24,7 @@ line-length = 120
 exclude = ["__pycache__", ".pytest_cache", "notes"]
 
 # P13：只攔真 bug（E/F），風格類（B/UP/SIM/W）暫不強制，避免大重構。
-# E402 豁免：try/except 降級匯入故意放中段；BROAD_EXCEPT_OK 是舊 noqa 記號，ruff 僅警告不攔。
+# E402 豁免：try/except 降級匯入故意放中段；BROAD_EXCEPT_OK 僅為註解記號，不影響 ruff。
 [tool.ruff.lint]
 select = ["E", "F"]
 ignore = ["E501", "E402"]

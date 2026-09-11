@@ -18,7 +18,6 @@ C. 傳統路：工具壞掉或關掉搜尋時走這裡，直接問模型，保�
 """
 
 # --- 標準函式庫匯入 ---
-from collections import OrderedDict  # 真 LRU 快取用，淘汰最久未用
 from collections.abc import Iterator  # 會一片一片回傳字串的串流函式｜新手：想成「會吐很多小紙條的機器」
 from collections.abc import Mapping  # dict 與唯讀映射的共同介面，取欄位時共用
 from dataclasses import dataclass, field  # 把相關狀態包成一包，取代散落的全域變數
@@ -42,11 +41,12 @@ logger = logging.getLogger(__name__)  # 本模組的日誌器，上層決定要�
 # 優化：嘗試匯入本地 RAG 檢索，缺檔或缺套件時降級為空函式，對話不受影響
 try:
     from rag_qdrant import search_local as _rag_search  # 本地筆記向量檢索
-except Exception:  # noqa: BROAD_EXCEPT_OK - rag 模組缺失時仍要能純網路問答
+except Exception:  # BROAD_EXCEPT_OK - rag 模組缺失時仍要能純網路問答
     def _rag_search(query: str, limit: int = 3) -> list[dict[str, str]]:
         return []
 
 import config as _config_module  # P10 即時同步用，保留 from 快照的同時可重讀真相
+from ttl_cache import TTLCache  # P14：共用 LRU＋TTL 快取，搜尋結果快取用
 
 
 # --- 全域常數設定（唯一真相在 config.py，這裡保留同名，對外寫法不變）---
@@ -59,8 +59,6 @@ from config import QUERY_REWRITE_LLM as QUERY_REWRITE_LLM
 from config import RAG_ENABLE as RAG_ENABLE
 from config import RAG_MAX_CHARS as RAG_MAX_CHARS
 from config import RAG_MAX_RESULTS as RAG_MAX_RESULTS
-from config import SEARCH_CACHE_MAX as _SEARCH_CACHE_MAX
-from config import SEARCH_CACHE_TTL as _SEARCH_CACHE_TTL
 from config import SEARCH_MAX_CHARS as SEARCH_MAX_CHARS
 from config import SEARCH_MAX_RESULTS as SEARCH_MAX_RESULTS
 from config import SEARCH_QUERY_MAX_CHARS as SEARCH_QUERY_MAX_CHARS
@@ -80,7 +78,7 @@ def _sync_config() -> None:
     """
     global HIST_MAX_CHARS, MAX_TOOL_ROUNDS, OLLAMA_MODEL, OLLAMA_RETRIES
     global OLLAMA_TIMEOUT, QUERY_REWRITE_LLM, RAG_ENABLE, RAG_MAX_CHARS
-    global RAG_MAX_RESULTS, _SEARCH_CACHE_MAX, _SEARCH_CACHE_TTL
+    global RAG_MAX_RESULTS
     global SEARCH_MAX_CHARS, SEARCH_MAX_RESULTS, SEARCH_QUERY_MAX_CHARS
     global SEARCH_SNIPPET_CHARS, SEARCH_TITLE_CHARS, SEARCH_TIMEOUT
     global USER_MAX_CHARS, _ollama
@@ -94,8 +92,7 @@ def _sync_config() -> None:
         RAG_ENABLE = _m.RAG_ENABLE
         RAG_MAX_CHARS = _m.RAG_MAX_CHARS
         RAG_MAX_RESULTS = _m.RAG_MAX_RESULTS
-        _SEARCH_CACHE_MAX = _m.SEARCH_CACHE_MAX
-        _SEARCH_CACHE_TTL = _m.SEARCH_CACHE_TTL
+        _SEARCH_CACHE.update_limits(_m.SEARCH_CACHE_MAX, _m.SEARCH_CACHE_TTL)
         SEARCH_MAX_CHARS = _m.SEARCH_MAX_CHARS
         SEARCH_MAX_RESULTS = _m.SEARCH_MAX_RESULTS
         SEARCH_QUERY_MAX_CHARS = _m.SEARCH_QUERY_MAX_CHARS
@@ -145,9 +142,11 @@ backtrace: Final[int] = 4
 _last_sources: list[SearchResult] = _default_state.last_sources  # 相容別名：同物件，原地修改
 _last_rag: list[dict[str, str]] = _default_state.last_rag  # 相容別名：同物件，原地修改
 _hist_lock = threading.Lock()
-_search_cache: OrderedDict[str, list[SearchResult]] = OrderedDict()
-_search_cache_time: OrderedDict[str, float] = OrderedDict()
-_search_cache_lock = threading.Lock()
+# P14：搜尋結果快取改用共用 TTLCache（原雙字典＋鎖已收斂進 ttl_cache.py）
+_SEARCH_CACHE: TTLCache[list[SearchResult]] = TTLCache(
+    maxsize=_config_module.SEARCH_CACHE_MAX,
+    ttl=_config_module.SEARCH_CACHE_TTL,
+)
 TAIPEI_TZ: Final[str] = "Asia/Taipei"
 _WEEKDAY_ZH: Final[tuple[str, ...]] = ("一", "二", "三", "四", "五", "六", "日")
 _DATE_KEYWORDS: Final[tuple[str, ...]] = (
@@ -379,37 +378,14 @@ def _remember(user_msg: str, assistant_msg: str, state: ChatState | None = None,
 
 
 def _cache_get(key: str) -> list[SearchResult] | None:
-    """真 LRU＋TTL 快取讀取，命中刷新順序，過期回 None｜新手：常用的小抄放前面，舊的先丟。」"""
-    with _search_cache_lock:
-        hit = _search_cache.get(key)
-        if hit is None:
-            return None
-        if time.monotonic() - _search_cache_time.get(key, 0.0) > _SEARCH_CACHE_TTL:
-            _search_cache.pop(key, None)
-            _search_cache_time.pop(key, None)
-            return None
-        # 命中即最近使用，移到尾端
-        _search_cache.move_to_end(key)
-        _search_cache_time.move_to_end(key)
-        return list(hit)
+    """共用 TTL 快取讀取（回複本），未命中或過期回 None｜新手：常用的小抄放前面，舊的先丟。」"""
+    hit = _SEARCH_CACHE.get(key)
+    return list(hit) if hit is not None else None
 
 
 def _cache_put(key: str, value: list[SearchResult]) -> None:
-    """真 LRU＋TTL 快取寫入，超量淘汰最久未用；寫入前順手清過期。」"""
-    now = time.monotonic()
-    with _search_cache_lock:
-        # 先清過期，避免過期佔位導致誤淘汰
-        expired = [k for k, t in _search_cache_time.items() if now - t > _SEARCH_CACHE_TTL]
-        for k in expired:
-            _search_cache.pop(k, None)
-            _search_cache_time.pop(k, None)
-        _search_cache[key] = list(value)
-        _search_cache_time[key] = now
-        _search_cache.move_to_end(key)
-        _search_cache_time.move_to_end(key)
-        while len(_search_cache) > _SEARCH_CACHE_MAX:
-            oldest, _ = _search_cache.popitem(last=False)
-            _search_cache_time.pop(oldest, None)
+    """共用 TTL 快取寫入（存複本），超量淘汰最久未用；內部順手清過期。」"""
+    _SEARCH_CACHE.put(key, list(value))
 
 
 def _truncate_user_msg(msg: str) -> str:
@@ -467,7 +443,7 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
             with ddgs_ctx as ddgs:
                 raw = list(ddgs.text(short_query, region="tw-twn", max_results=max_results))
             break
-        except Exception as e:  # noqa: BROAD_EXCEPT_OK - httpx 錯誤型別不一，邊界統一降級
+        except Exception as e:  # BROAD_EXCEPT_OK - httpx 錯誤型別不一，邊界統一降級
             logger.warning("網頁搜尋第 %d 次失敗：%s", attempt + 1, e)
             if attempt == 0:
                 time.sleep(random.uniform(0.2, 0.5))
@@ -534,7 +510,7 @@ def _retrieve_rag(query: str, state: ChatState | None = None) -> list[dict[str, 
     try:
         retrieval_query = _maybe_llm_rewrite(query)
         hits = _rag_search(retrieval_query or query, limit=RAG_MAX_RESULTS)
-    except Exception as e:  # noqa: BROAD_EXCEPT_OK - 嵌入／Qdrant 斷線降級為無命中
+    except Exception as e:  # BROAD_EXCEPT_OK - 嵌入／Qdrant 斷線降級為無命中
         logger.warning("本地檢索失敗，已降級為無命中：%s", e)
         return []
     with _hist_lock:
@@ -660,7 +636,7 @@ def _call_chat_with_retry(messages: list[ChatMessage], model: str, tools: list[d
     for attempt in range(OLLAMA_RETRIES + 1):
         try:
             return _call_chat_once(messages, model, tools)
-        except Exception as e:  # noqa: BROAD_EXCEPT_OK - 連線／模型錯誤邊界重試
+        except Exception as e:  # BROAD_EXCEPT_OK - 連線／模型錯誤邊界重試
             last_err = e
             logger.warning("ollama.chat 第 %d 次失敗：%s", attempt + 1, e)
             if attempt < OLLAMA_RETRIES:
@@ -683,7 +659,7 @@ def _stream_reply(messages: list[ChatMessage], model: str | None = None) -> Iter
         try:
             stream = _ollama.chat(model=use_model, messages=messages, stream=True)
             break
-        except Exception as e:  # noqa: BROAD_EXCEPT_OK - 建立串流失敗重試一次
+        except Exception as e:  # BROAD_EXCEPT_OK - 建立串流失敗重試一次
             logger.warning("串流建立第 %d 次失敗（%s）", attempt + 1, e)
             if attempt == 0:
                 time.sleep(random.uniform(0.2, 0.5))
@@ -704,10 +680,10 @@ def _stream_reply(messages: list[ChatMessage], model: str | None = None) -> Iter
                         logger.debug("觀測 首字延遲=%.1fms 模型=%s", (time.perf_counter() - t0) * 1000, use_model)
                         first = False
                     yield content
-            except Exception as e:  # noqa: BROAD_EXCEPT_OK - 單一 chunk 解析失敗，跳過不炸整輪
+            except Exception as e:  # BROAD_EXCEPT_OK - 單一 chunk 解析失敗，跳過不炸整輪
                 logger.warning("串流 chunk 解析失敗（%s），已跳過", e)
                 continue
-    except Exception as e:  # noqa: BROAD_EXCEPT_OK - 串流中斷（雲端斷線），保留已生成片段
+    except Exception as e:  # BROAD_EXCEPT_OK - 串流中斷（雲端斷線），保留已生成片段
         logger.warning("串流中斷（%s），已保留已生成的片段", e)
         return
 
@@ -842,10 +818,12 @@ def _handle_tool_flow(messages: list[ChatMessage], user_msg: str, today: str, ra
         local_adequate = _rag_adequate(rag_hits) or _is_chitchat(user_msg)
     else:
         local_adequate = bool(rag_block) or _is_chitchat(user_msg)
-    # 明確要求即時資料時，本地命中不足以取代網路，仍要補搜
+    # 明確要求即時資料時，本地命中不足以取代網路，仍要補搜；
+    # P14：但工具迴圈若已搜過網（本回合 last_sources 有值），就不再重複搜一次
     wants_realtime = _needs_realtime(user_msg)
+    realtime_needs_search = wants_realtime and not st.last_sources
     needs_legacy_search = all(m.get("role") != "tool" for m in messages) and not local_adequate
-    if (needs_legacy_search or wants_realtime) and not _is_chitchat(user_msg):
+    if (needs_legacy_search or realtime_needs_search) and not _is_chitchat(user_msg):
         facts = _format_search_results(_search_web(user_msg, state=st))
         parts = [f"今天是 {today}（台灣時間）。"]
         if rag_block:
@@ -902,7 +880,8 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
     t0 = time.perf_counter()
     # 優化：明確要求即時資料的問句，跳過本地筆記檢索（RAG + reranker），直接進工具／搜尋流程
     # 本地筆記通常沒有新聞、股價、天氣等即時內容；先搜網更快且答案更新
-    if _needs_realtime(user_msg):
+    realtime = _needs_realtime(user_msg)  # P14：同一輪只算一次，日誌不再重複計算
+    if realtime:
         rag_hits = []
         rag_ms = (time.perf_counter() - t0) * 1000
     else:
@@ -910,7 +889,7 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
         rag_ms = (time.perf_counter() - t0) * 1000
     rag_block = _format_rag_results(rag_hits)
     base = _build_base_messages(sys_msg, user_msg, today, rag_block, state=st)
-    logger.debug("觀測 rag_hits=%d rag_ms=%.1f realtime=%s", len(rag_hits), rag_ms, _needs_realtime(user_msg))
+    logger.debug("觀測 rag_hits=%d rag_ms=%.1f realtime=%s", len(rag_hits), rag_ms, realtime)
     if search_g is True:
         try:
             t1 = time.perf_counter()
@@ -919,7 +898,7 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
             logger.debug("觀測 tool_rounds=%d tool_ms=%.1f sources=%d", len([m for m in messages if m.get('role') == 'tool']), tool_ms, len(st.last_sources))
             yield from _handle_tool_flow(messages, user_msg, today, rag_block, use_model, state=st, rag_hits=rag_hits)
             return
-        except Exception as e:  # noqa: BROAD_EXCEPT_OK - 工具流程失敗降級為舊流程
+        except Exception as e:  # BROAD_EXCEPT_OK - 工具流程失敗降級為舊流程
             logger.warning("工具流程降級為傳統流程：%s", e)
             pass
     yield from _handle_legacy_flow(sys_msg, user_msg, today, use_model, state=st)

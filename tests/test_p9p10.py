@@ -51,8 +51,7 @@ class TestSearchRetry:
     def test_retry_succeeds_second(self) -> None:
         import chat_core
 
-        chat_core._search_cache.clear()
-        chat_core._search_cache_time.clear()
+        chat_core._SEARCH_CACHE.clear()
         good = mock.MagicMock()
         good.__enter__.return_value.text.return_value = [{"title": "t", "body": "s", "href": "https://e.com"}]
         with mock.patch.object(chat_core, "DDGS", side_effect=[Exception("boom"), good]) as m:
@@ -60,8 +59,7 @@ class TestSearchRetry:
                 out = chat_core._search_web("重試測試P9", state=chat_core.ChatState())
         assert len(out) == 1
         assert m.call_count == 2
-        chat_core._search_cache.clear()
-        chat_core._search_cache_time.clear()
+        chat_core._SEARCH_CACHE.clear()
 
 
 class TestCrossModuleSync:
@@ -80,6 +78,6 @@ class TestCrossModuleSync:
             assert c.USER_MAX_CHARS == 4321
             assert chat_core.USER_MAX_CHARS == 4321
             assert r.RERANK_BATCH == 4
-            assert rq._QUERY_VEC_CACHE_MAX == 11
+            assert rq._QUERY_VEC_CACHE.maxsize == 11
         finally:
             c.refresh()

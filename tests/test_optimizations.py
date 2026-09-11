@@ -65,9 +65,8 @@ class TestToolsLive:
 
 class TestSearchLRU:
     def test_lru_refresh_and_evict(self) -> None:
-        with mock.patch.object(chat_core, "_SEARCH_CACHE_MAX", 2):
-            chat_core._search_cache.clear()
-            chat_core._search_cache_time.clear()
+        with mock.patch.object(chat_core._SEARCH_CACHE, "maxsize", 2):
+            chat_core._SEARCH_CACHE.clear()
             chat_core._cache_put("a", [{"title": "a", "snippet": "a", "url": "u"}])
             chat_core._cache_put("b", [{"title": "b", "snippet": "b", "url": "u"}])
             # 命中 a 使其變最新，寫入 c 時應淘汰 b 而非 a
@@ -76,8 +75,7 @@ class TestSearchLRU:
             assert chat_core._cache_get("a") is not None
             assert chat_core._cache_get("b") is None
             assert chat_core._cache_get("c") is not None
-            chat_core._search_cache.clear()
-            chat_core._search_cache_time.clear()
+            chat_core._SEARCH_CACHE.clear()
 
 
 class TestToolArgTypes:
