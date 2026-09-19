@@ -57,15 +57,19 @@ class TestTrimHist:
 # ------------------------------------------------------------
 class TestStableId:
     def test_same_content_same_id(self) -> None:
+        """同來源同內容 ID 穩定，重複匯入覆寫不新增。」"""
         assert _stable_id("a.md", "hello") == _stable_id("a.md", "hello")
 
     def test_diff_content_diff_id(self) -> None:
+        """內容不同 ID 不同。」"""
         assert _stable_id("a.md", "hello") != _stable_id("a.md", "world")
 
     def test_diff_source_diff_id(self) -> None:
+        """來源不同 ID 不同。」"""
         assert _stable_id("a.md", "hello") != _stable_id("b.md", "hello")
 
     def test_is_32hex(self) -> None:
+        """ID 為 32 字小寫十六進位（MD5 格式）。」"""
         v = _stable_id("s", "t")
         assert len(v) == 32
         assert all(c in "0123456789abcdef" for c in v)
@@ -76,19 +80,24 @@ class TestStableId:
 # ------------------------------------------------------------
 class TestClampScore:
     def test_within_range(self) -> None:
+        """範圍內分數原樣通過。」"""
         assert _clamp_score(5.5) == 5.5
 
     def test_clamps_high(self) -> None:
+        """超 10 夾到 10，避免模型亂給高分。」"""
         assert _clamp_score(100.0) == 10.0
 
     def test_clamps_negative(self) -> None:
+        """負分夾到 0。」"""
         assert _clamp_score(-3.0) == 0.0
 
     def test_bad_value_zero(self) -> None:
+        """壞值（字串／None）回 0 不拋錯。」"""
         assert _clamp_score("abc") == 0.0
         assert _clamp_score(None) == 0.0
 
     def test_numeric_string(self) -> None:
+        """數字字串去空白轉浮點。」"""
         assert _clamp_score(" 7.2 ") == 7.2
 
 
@@ -97,6 +106,7 @@ class TestClampScore:
 # ------------------------------------------------------------
 class TestApplyThreshold:
     def test_no_threshold_keeps_all(self) -> None:
+        """沒設門檻（-inf）全保留。」"""
         import reranker as r
         docs = [{"text": "a", "score": "1"}, {"text": "b", "score": "9"}]
         old = r.RERANK_THRESHOLD
@@ -107,6 +117,7 @@ class TestApplyThreshold:
             r.RERANK_THRESHOLD = old
 
     def test_filters_low_scores(self) -> None:
+        """低於門檻丟掉，只留高分。」"""
         import reranker as r
         docs = [{"text": "a", "score": "1"}, {"text": "b", "score": "9"}]
         old = r.RERANK_THRESHOLD
@@ -119,6 +130,7 @@ class TestApplyThreshold:
             r.RERANK_THRESHOLD = old
 
     def test_keeps_at_least_one(self) -> None:
+        """全被濾掉也留第 1 名，避免空結果。」"""
         import reranker as r
         docs = [{"text": "a", "score": "0.1"}]
         old = r.RERANK_THRESHOLD
@@ -130,6 +142,7 @@ class TestApplyThreshold:
             r.RERANK_THRESHOLD = old
 
     def test_missing_score_kept(self) -> None:
+        """缺分數當保留，避免誤殺無分數命中。」"""
         import reranker as r
         docs = [{"text": "no-score"}]
         old = r.RERANK_THRESHOLD
@@ -184,15 +197,19 @@ class TestFormatRagResults:
 # ------------------------------------------------------------
 class TestCheckKeywords:
     def test_all_hit(self) -> None:
+        """關鍵字全中回全部。」"""
         assert _check_keywords("帶傘雷陣雨", ["帶傘", "雷陣雨"]) == ["帶傘", "雷陣雨"]
 
     def test_partial_hit(self) -> None:
+        """只中部分回命中的子集。」"""
         assert _check_keywords("只有帶傘", ["帶傘", "雷陣雨"]) == ["帶傘"]
 
     def test_no_hit(self) -> None:
+        """全不中回空串列。」"""
         assert _check_keywords("無關文字", ["帶傘"]) == []
 
     def test_empty_keywords(self) -> None:
+        """空考題回空，不誤判。」"""
         assert _check_keywords("任何文字", []) == []
 
 
@@ -209,6 +226,7 @@ class TestConfigConsistency:
         assert config.OLLAMA_TIMEOUT == c.OLLAMA_TIMEOUT == rq._CONFIG.timeout == r._ollama_timeout
 
     def test_model_single_source(self) -> None:
+        """OLLAMA_MODEL 兩處一致。」"""
         import config
         import chat_core as c
         assert config.OLLAMA_MODEL == c.OLLAMA_MODEL

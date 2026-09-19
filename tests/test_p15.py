@@ -17,10 +17,12 @@ import rag_qdrant as rq
 # ------------------------------------------------------------
 class TestSingleCallAnswer:
     def test_no_tool_answer_single_model_call(self) -> None:
+        """沒叫工具的那一輪串流即答案，只生成一次不重生。」"""
         st = chat_core.ChatState()
         calls: list = []
 
         def fake_chat(**kw):
+            """假模型：直接回兩片答案，不帶工具呼叫。」"""
             calls.append(kw)
             return iter([{"message": {"content": "答"}}, {"message": {"content": "案"}}])
 
@@ -37,10 +39,12 @@ class TestSingleCallAnswer:
 # ------------------------------------------------------------
 class TestToolRoundStream:
     def test_tool_then_answer(self) -> None:
+        """一輪工具＋一輪作答＝兩次生成，作答輪看得到工具結果。」"""
         st = chat_core.ChatState()
         calls: list = []
 
         def fake_chat(**kw):
+            """假模型：首輪回工具呼叫，次輪回答案。」"""
             calls.append(kw)
             if len(calls) == 1:
                 tc = {"function": {"name": "search_web", "arguments": '{"query": "q"}'}}
@@ -64,14 +68,17 @@ class TestToolRoundStream:
 # ------------------------------------------------------------
 class TestPreSearchFlow:
     def test_presearch_before_model_call(self) -> None:
+        """預補搜在模型開跑前：順序 search→model。」"""
         st = chat_core.ChatState()
         order: list[str] = []
 
         def fake_search(query, max_results=None, state=None):
+            """假搜尋：記順序回空，不碰網路。」"""
             order.append("search")
             return []
 
         def fake_chat(**kw):
+            """假模型：記順序回單片答案。」"""
             order.append("model")
             return iter([{"message": {"content": "回"}}])
 
@@ -87,11 +94,13 @@ class TestPreSearchFlow:
 # ------------------------------------------------------------
 class TestLegacyRagBlock:
     def test_no_search_includes_rag_block(self) -> None:
+        """--no-search 照吃本地筆記：提示詞含筆記內容。」"""
         st = chat_core.ChatState()
         hits = [{"source": "a.md", "text": "筆記內容", "score": "0.9"}]
         captured: list = []
 
         def fake_stream(messages, model=None):
+            """假串流：收提示詞供斷言，回單片答案。」"""
             captured.append(messages)
             return iter(["好"])
 
@@ -108,14 +117,22 @@ class TestLegacyRagBlock:
 # ------------------------------------------------------------
 class TestClientLifecycle:
     def test_sync_config_closes_replaced_client(self, monkeypatch) -> None:
-        old_client = mock.Mock()
-        monkeypatch.setattr(chat_core, "_ollama", old_client)
-        monkeypatch.setattr(chat_core, "OLLAMA_TIMEOUT", -1.0)  # 與 config 快照不同 → 觸發重建
-        new_client = mock.Mock()
-        monkeypatch.setattr(chat_core.ollama, "Client", mock.Mock(return_value=new_client))
-        chat_core._sync_config()
-        old_client.close.assert_called_once()
-        assert chat_core._ollama is new_client
+        """換逾時重建 client：舊的關閉、新的上位，共用快取快照還原。」"""
+        import ollama_shared
+
+        snapshot = dict(ollama_shared._clients)
+        try:
+            old_client = mock.Mock()
+            monkeypatch.setattr(chat_core, "_ollama", old_client)
+            monkeypatch.setattr(chat_core, "OLLAMA_TIMEOUT", -1.0)  # 與 config 快照不同 → 觸發重建
+            new_client = mock.Mock()
+            monkeypatch.setattr(chat_core.ollama, "Client", mock.Mock(return_value=new_client))
+            chat_core._sync_config()
+            old_client.close.assert_called_once()
+            assert chat_core._ollama is new_client
+        finally:
+            ollama_shared._clients.clear()
+            ollama_shared._clients.update(snapshot)
 
 
 # ------------------------------------------------------------
@@ -123,10 +140,12 @@ class TestClientLifecycle:
 # ------------------------------------------------------------
 class TestIngestPartialOk:
     def test_partial_embed_failure_not_ok(self, tmp_path: Path) -> None:
+        """部分嵌入失敗不標整檔 ok，壞塊下次重試補寫。」"""
         (tmp_path / "full.md").write_text("hello world", encoding="utf-8")
         (tmp_path / "partial.md").write_text("A" * 900 + "\n\n" + "B" * 900, encoding="utf-8")
 
         def fake_flush(client, chunks, metas, ensured):
+            """假寫入：partial.md 只成功一部分，其餘全成功。」"""
             src = metas[0].get("source", "")
             if src == "partial.md":
                 return (1, 0)  # 只成功一部分
@@ -147,6 +166,7 @@ class TestIngestPartialOk:
 # ------------------------------------------------------------
 class TestBoundedReads:
     def test_txt_does_not_read_beyond_limit(self, tmp_path: Path) -> None:
+        """純文字只讀到上限＋1 字就停，尾部標記讀不到。」"""
         import dataclasses
 
         fp = tmp_path / "big.md"
@@ -158,6 +178,7 @@ class TestBoundedReads:
         assert "已截斷" in out
 
     def test_csv_stops_at_limit(self, tmp_path: Path) -> None:
+        """CSV 讀到上限＋1 列即停，大檔不整檔進記憶體。」"""
         import dataclasses
 
         fp = tmp_path / "big.csv"
@@ -173,6 +194,7 @@ class TestBoundedReads:
 # ------------------------------------------------------------
 class TestHealthCheck:
     def test_all_ok(self) -> None:
+        """全通回 0：重排雙可用＋Qdrant 有收藏集。」"""
         import types
 
         import chat_cli
@@ -185,6 +207,7 @@ class TestHealthCheck:
         assert rc == 0
 
     def test_failures_return_nonzero(self) -> None:
+        """有缺回 1：重排全不可用＋Qdrant 連不上。」"""
         import chat_cli
 
         with mock.patch("reranker.probe_availability", return_value={"crossencoder": False, "llm": False}):

@@ -14,8 +14,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps
-        run: pip install -r requirements.txt pytest==9.1.1 ruff
+        run: pip install -r requirements.txt pytest==9.1.1 ruff pyright
       - name: Lint
         run: python -m ruff check .
+      - name: Types
+        run: python -m pyright
       - name: Tests
         run: python -m pytest -q

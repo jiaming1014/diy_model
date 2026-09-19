@@ -12,6 +12,7 @@ import chat_core
 
 class TestTextLimit:
     def test_txt_truncated(self, tmp_path: Path) -> None:
+        """純文字超上限截斷並註記，不再整檔載入記憶體。」"""
         import dataclasses
 
         import rag_qdrant as rq
@@ -31,6 +32,7 @@ class TestToolDedup:
         calls: list = []
 
         def fake_chat(**kw):
+            """假模型：首輪回重複工具呼叫，次輪回答案。」"""
             calls.append(kw)
             if len(calls) == 1:
                 tc = {"function": {"name": "search_web", "arguments": '{"query": "同"}'}}
@@ -45,12 +47,14 @@ class TestToolDedup:
         assert "done" in "".join(out)
 
     def test_key_stable(self) -> None:
+        """工具去重鍵：同名同參相同、參數不同則不同。」"""
         assert chat_core._tool_call_key("a", {"x": 1}) == chat_core._tool_call_key("a", {"x": 1})
         assert chat_core._tool_call_key("a", {"x": 1}) != chat_core._tool_call_key("a", {"x": 2})
 
 
 class TestDimFailFast:
     def test_mismatch_raises(self) -> None:
+        """收藏集維度與模型不符早拋錯，不空轉寫入。」"""
         import rag_qdrant as rq
 
         fake_info = mock.Mock()
@@ -68,6 +72,7 @@ class TestDimFailFast:
 
 class TestFirstToken:
     def test_logs_first_token(self, caplog) -> None:
+        """首字延遲觀測：首個內容片輸出時記 debug 日誌。」"""
         import logging
 
         fake_stream = iter([{"message": {"content": "嗨"}}])
@@ -80,6 +85,7 @@ class TestFirstToken:
 
 class TestIngestProgress:
     def test_callback_called(self, tmp_path: Path) -> None:
+        """進度回調每檔觸發一次，回傳統一 (完成數, 總數, 檔名)。」"""
         import rag_qdrant as rq
 
         (tmp_path / "a.md").write_text("hello", encoding="utf-8")

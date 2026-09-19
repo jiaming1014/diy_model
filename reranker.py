@@ -33,13 +33,19 @@ import config as _config_module
 from config import OLLAMA_TIMEOUT as _ollama_timeout
 from config import RERANK_BACKEND as RERANK_BACKEND
 from config import RERANK_BATCH as RERANK_BATCH
+from config import RERANK_DOC_MAX_CHARS as RERANK_DOC_MAX_CHARS
 from config import RERANK_ENABLE as RERANK_ENABLE
 from config import RERANK_LLM_MODEL as RERANK_LLM_MODEL
 from config import RERANK_MODEL as RERANK_MODEL
+from config import RERANK_QUERY_MAX_CHARS as RERANK_QUERY_MAX_CHARS
 from config import RERANK_SNIPPET_CHARS as RERANK_SNIPPET_CHARS
 from config import RERANK_THRESHOLD as RERANK_THRESHOLD
 
 logger = logging.getLogger(__name__)
+
+# P17：逐筆備援上限＋並行，避免整批解析失敗時 N 次串行拖延。
+_LLM_PERDOC_MAX: int = 8  # 超過此數的文件，超出部分直接記 0 分，不再逐筆打模型
+_LLM_PERDOC_WORKERS: int = 4  # 逐筆備援並行數
 
 
 def _sync_config() -> None:
@@ -49,6 +55,7 @@ def _sync_config() -> None:
     等於每次重排都重建），換掉前先關舊連線。
     """
     global _ollama_timeout, RERANK_BACKEND, RERANK_BATCH, RERANK_ENABLE
+    global RERANK_DOC_MAX_CHARS, RERANK_QUERY_MAX_CHARS
     global RERANK_LLM_MODEL, RERANK_MODEL, RERANK_SNIPPET_CHARS, RERANK_THRESHOLD
     global _cross_model, _cross_model_name, _ollama, _ollama_timeout_used
     try:
@@ -57,6 +64,8 @@ def _sync_config() -> None:
         RERANK_BATCH = _m.RERANK_BATCH
         RERANK_ENABLE = _m.RERANK_ENABLE
         RERANK_LLM_MODEL = _m.RERANK_LLM_MODEL
+        RERANK_DOC_MAX_CHARS = _m.RERANK_DOC_MAX_CHARS
+        RERANK_QUERY_MAX_CHARS = _m.RERANK_QUERY_MAX_CHARS
         RERANK_SNIPPET_CHARS = _m.RERANK_SNIPPET_CHARS
         RERANK_THRESHOLD = _m.RERANK_THRESHOLD
         if RERANK_MODEL != _m.RERANK_MODEL:
@@ -64,16 +73,11 @@ def _sync_config() -> None:
             _cross_model = None
             _cross_model_name = ""
         # ollama 超時真的變了才重建，下次 _get_ollama 會用新逾時
+        # P17：改拿共用快取，快取內的舊 client 不關閉（可能他處仍在用）
         new_timeout = _m.OLLAMA_TIMEOUT
         if _ollama_timeout_used != new_timeout:
             _ollama_timeout_used = new_timeout
-            old = _ollama
-            _ollama = None
-            if old is not None:
-                try:
-                    old.close()
-                except Exception:
-                    pass
+            _ollama = None  # 延遲重建：下次 _get_ollama 取共用快取的新逾時實例
         _ollama_timeout = new_timeout
     except Exception as e:
         logger.warning("重排配置同步失敗，沿用舊快照：%s", e)
@@ -88,13 +92,14 @@ _ollama_timeout_used: float = _ollama_timeout  # P14：記住上次建立 client
 
 
 def _get_ollama():
-    """延遲取得帶逾時的 ollama client，缺套件回 None。」"""
+    """延遲取得共用 ollama client（同 timeout 跨模組共用），缺套件回 None。」"""
     global _ollama
     if _ollama is not None:
         return _ollama
     try:
-        import ollama
-        _ollama = ollama.Client(timeout=_ollama_timeout)
+        from ollama_shared import get_shared_client
+
+        _ollama = get_shared_client(_ollama_timeout)
     except Exception:  # BROAD_EXCEPT_OK - 缺套件時回 None，交由上層降級
         _ollama = None
     return _ollama
@@ -149,27 +154,6 @@ def _load_cross_model():
             return None
 
 
-def is_available() -> bool:
-    """輕量檢查：套件＋模型名，不打網路、不載大模型。」"""
-    if not RERANK_ENABLE or RERANK_BACKEND == "none":
-        return False
-    if RERANK_BACKEND in ("auto", "crossencoder"):
-        import importlib.util
-        if importlib.util.find_spec("sentence_transformers") is not None:
-            return True
-        if RERANK_BACKEND == "crossencoder":
-            return False
-    if RERANK_BACKEND in ("auto", "llm"):
-        if not RERANK_LLM_MODEL.strip():
-            return False
-        try:
-            import ollama  # noqa: F401 - 僅檢查套件存在
-            return True
-        except ImportError:
-            return False
-    return False
-
-
 def _list_ollama_names() -> list[str] | None:
     """列出 Ollama 模型名，失敗回 None。」"""
     try:
@@ -200,10 +184,20 @@ def _list_ollama_names() -> list[str] | None:
 
 
 def probe_availability(timeout_s: float = 5.0) -> dict[str, bool]:
-    """主動探測兩種評審是否真可用，逾時當不可用｜新手：健康檢查，不是每次問都要做。」"""
+    """主動探測兩種評審是否真可用，逾時當不可用｜新手：健康檢查，不是每次問都要做。
+
+    P22：尊重開關與後端選擇——RERANK_ENABLE=0 或 RERANK_BACKEND=none 回雙 False，
+    指定單一後端時只探測該後端，不誤報用不到的評審可用。
+    """
     result = {"crossencoder": False, "llm": False}
+    if not RERANK_ENABLE or RERANK_BACKEND == "none":
+        return result
     import importlib.util
-    result["crossencoder"] = importlib.util.find_spec("sentence_transformers") is not None
+
+    if RERANK_BACKEND in ("auto", "crossencoder"):
+        result["crossencoder"] = importlib.util.find_spec("sentence_transformers") is not None
+    if RERANK_BACKEND not in ("auto", "llm"):
+        return result
     # 優化：timeout_s 真的生效，ollama.list 卡住不等到底
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_list_ollama_names)
@@ -235,8 +229,8 @@ def _rerank_cross(query: str, docs: list[dict[str, str]], top_k: int) -> list[di
         batch = max(1, int(RERANK_BATCH or 8))
         scores: list[float] = []
         for i in range(0, len(docs), batch):
-            # 註：按字元截 2000 是省記憶體的近似，中文大致 1 字 ~ 1-2 token
-            pairs = [[query, str(d.get("text", "") or "")[:2000]] for d in docs[i:i + batch]]
+            # 註：按字元截斷是省記憶體的近似，中文大致 1 字 ~ 1-2 token
+            pairs = [[query, str(d.get("text", "") or "")[:RERANK_DOC_MAX_CHARS]] for d in docs[i:i + batch]]
             try:
                 part = model.predict(pairs)
             except Exception as e:
@@ -275,7 +269,7 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
     prompt = (
         "你是檢索評分員。依與問題的相關程度，為每條文件打 0~10 分（10 最相關）。"
         "只回 JSON 陣列，例如 [8.5, 2.0, 0]，不要解釋。\n"
-        f"問題：{query[:500]}\n文件：\n" + "\n".join(lines)
+        f"問題：{query[:RERANK_QUERY_MAX_CHARS]}\n文件：\n" + "\n".join(lines)
     )
     try:
         msg = client.chat(model=RERANK_LLM_MODEL, messages=[{"role": "user", "content": prompt}])
@@ -297,22 +291,35 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
     if len(nums) == len(docs) and "[" in text and "]" in text:
         return nums[:len(docs)]
     # P6 強韌：整批解析失敗改逐筆打分，單筆失敗記 0 分不丟整批
-    logger.warning("LLM 整批解析失敗，改逐筆備援（%d 筆）", len(docs))
-    per_doc: list[float] = []
-    for d in docs:
+    # P17：加並行＋上限，N 筆串行是最大延遲炸彈；超過上限的直接記 0 分
+    logger.warning("LLM 整批解析失敗，改逐筆備援（%d 筆，上限 %d）", len(docs), _LLM_PERDOC_MAX)
+    target = docs[:_LLM_PERDOC_MAX]
+    per_doc: list[float] = [0.0] * len(docs)
+
+    def _score_one(idx_doc: tuple[int, dict[str, str]]) -> tuple[int, float]:
+        """單文件打分：LLM 只回一個 0~10 數字，失敗記 0 分不丟整批。」"""
+        idx, d = idx_doc
         snippet = str(d.get("text", "") or "")[:RERANK_SNIPPET_CHARS].replace("\n", " ")
         try:
             single = client.chat(
                 model=RERANK_LLM_MODEL,
-                messages=[{"role": "user", "content": f"你是檢索評分員。依與問題的相關程度，為文件打 0~10 分，只回一個數字。\n問題：{query[:500]}\n文件：{snippet}"}],
+                messages=[{"role": "user", "content": f"你是檢索評分員。依與問題的相關程度，為文件打 0~10 分，只回一個數字。\n問題：{query[:RERANK_QUERY_MAX_CHARS]}\n文件：{snippet}"}],
             )
             s_raw = single["message"] if isinstance(single, dict) else getattr(single, "message", None)
             s_text = str(s_raw.get("content") if isinstance(s_raw, dict) else getattr(s_raw, "content", "") or "")
             m = re.search(r"\d+(?:\.\d+)?", s_text)
-            per_doc.append(_clamp_score(m.group(0)) if m else 0.0)
+            return idx, (_clamp_score(m.group(0)) if m else 0.0)
         except Exception as e:
             logger.warning("LLM 逐筆打分失敗，已記 0 分：%s", e)
-            per_doc.append(0.0)
+            return idx, 0.0
+
+    if len(target) == 1:
+        idx, score = _score_one((0, target[0]))
+        per_doc[idx] = score
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(_LLM_PERDOC_WORKERS, len(target))) as ex:
+            for idx, score in ex.map(_score_one, list(enumerate(target))):
+                per_doc[idx] = score
     if len(per_doc) == len(docs):
         return per_doc
     logger.warning("LLM 回傳無法解析為 %d 個分數（原文前 200 字：%r），已降級為原順序", len(docs), text[:200])
@@ -342,7 +349,7 @@ def rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[
         return []
     if not RERANK_ENABLE or RERANK_BACKEND == "none":
         return docs[:top_k]
-    q = query.strip()[:2000]
+    q = query.strip()[:RERANK_DOC_MAX_CHARS]
     if not q:
         return docs[:top_k]
     result: list[dict[str, str]] | None = None

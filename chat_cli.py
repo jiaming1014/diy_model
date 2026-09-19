@@ -8,10 +8,14 @@
 輸入 q、quit、exit、離開、結束、掰掰、再見，或按 Ctrl+C / Ctrl+D 都可以優雅離開。
 空行會視為「還沒想好」，直接等下一句，不會關店。
 
+【對話內指令】
+- /ingest：就地匯入工作區筆記到 Qdrant（不用跳出對話）
+- /ingest 資料夾：匯入指定資料夾，例如 /ingest notes
+
 【啟動參數】
 - python chat_cli.py：直接開聊（自動載入上次歷史）
 - python chat_cli.py --model llama3.2:1b：指定模型
-- python chat_cli.py --no-search：關掉工具搜尋（純問模型）
+- python chat_cli.py --no-search：只關上網搜尋（本機寫檔、播音樂照常）
 - python chat_cli.py --no-history：不載入／不存歷史
 - python chat_cli.py --health：檢查重排後端與 Qdrant 連線後結束（P15）
 """
@@ -27,9 +31,10 @@ from pathlib import Path
 
 from chat_core import OLLAMA_MODEL as _DEFAULT_MODEL
 from chat_core import ChatState, chat_w, get_last_rag, get_last_sources
+from chat_core import DEFAULT_SYS_MSG  # P17：系統提示唯一真相在 chat_core
 import chat_core as _core
 
-sys_msg = '請透過所提供的資料回答使用者問題，並一律使用繁體中文（台灣用語）回答'
+sys_msg = DEFAULT_SYS_MSG  # 相容舊匯入：值與 chat_core.DEFAULT_SYS_MSG 同一內容
 MODEL = _DEFAULT_MODEL
 _QUIT_CMDS = {"q", "quit", "exit", "離開", "結束", "掰掰", "再見"}
 _DEFAULT_HIST = Path.home() / ".diy_model_hist.json"  # 相容快照，運行請走 _hist_path()
@@ -40,18 +45,15 @@ def _hist_path() -> Path:
     """每次讀環境變數，改 DIY_HIST_FILE 不用重啟｜新手：地址每次出門現查，不抄舊紙條。」"""
     return Path(os.getenv("DIY_HIST_FILE", str(_DEFAULT_HIST)))
 
-# 相容舊匯入：保留名稱，值為啟動時快照
-_HIST_FILE = _hist_path()
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析啟動參數｜新手：開店前先看客人有沒有特別交代。」"""
     ap = argparse.ArgumentParser(description="本地 Ollama 聊天 CLI")
     ap.add_argument("--model", default=MODEL, help=f"使用的 Ollama 模型（預設 {MODEL}）")
-    ap.add_argument("--no-search", action="store_true", help="關掉工具搜尋，純問模型")
+    ap.add_argument("--no-search", action="store_true", help="只關上網搜尋（本機寫檔、播音樂、查日期照常）")
     ap.add_argument("--verbose", action="store_true", help="顯示降級等除錯訊息")
     ap.add_argument("--no-history", action="store_true", help="不載入／不存歷史")
-    ap.add_argument("--health", action="store_true", help="檢查重排後端與 Qdrant 連線後結束（不做對話）")
+    ap.add_argument("--health", action="store_true", help="檢查重排後端、Qdrant 連線與工作區可寫後結束（不做對話）")
     return ap.parse_args(argv)
 
 
@@ -165,20 +167,56 @@ def _print_sources(state: ChatState) -> None:
     print('', flush=True)
 
 
-def _run_health_check(model: str) -> int:
-    """--health：檢查重排後端與 Qdrant 連線，回 0 全通、1 有缺（P15）。
+def _ingest_target(cmd: str) -> str | None:
+    """解析 /ingest 指令：非指令回 None；有參數用參數，否則用工作區根。」"""
+    s = cmd.strip()
+    if s != "/ingest" and not s.startswith("/ingest "):
+        return None
+    arg = s[len("/ingest"):].strip().strip("\"'")
+    if arg:
+        return arg
+    return str(_core._workspace_root())
 
-    唯讀操作、不進對話迴圈；聊天模型與 Ollama 的實際可用性在對話時驗證。
+
+def _run_ingest_command(cmd: str) -> None:
+    """執行 /ingest：就地匯入筆記，任何失敗印訊息不中斷對話。」"""
+    try:
+        target = _ingest_target(cmd)
+        if target is None:
+            return
+        import rag_qdrant  # 延遲匯入：平時對話不付 Qdrant 啟動成本
+
+        print(f"開始匯入：{target}", flush=True)
+        n = rag_qdrant.ingest_folder(
+            target,
+            on_progress=lambda done, total, rel: print(f"[{done}/{total}] {rel}", flush=True),
+        )
+    except Exception as e:
+        print(f"匯入失敗：{e}", flush=True)
+        return
+    print(f"匯入完成，共 {n} 點。", flush=True)
+
+
+def _run_health_check(model: str) -> int:
+    """--health：檢查重排後端、Qdrant 連線與工作區可寫，回 0 全通、1 有缺（P15）。
+
+        唯讀操作、不進對話迴圈；聊天模型與 Ollama 的實際可用性在對話時驗證。
     """
     ok = True
     try:
-        from reranker import probe_availability
+        import reranker as _rr
 
-        avail = probe_availability()
-        print(f"重排 CrossEncoder：{'可用' if avail.get('crossencoder') else '不可用'}", flush=True)
-        print(f"重排 LLM 備援：{'可用' if avail.get('llm') else '不可用'}", flush=True)
-        if not avail.get("crossencoder") and not avail.get("llm"):
-            ok = False
+        if (not _rr.RERANK_ENABLE) or _rr.RERANK_BACKEND == "none":
+            # P22：刻意停用不算故障，印狀態但不判定失敗
+            print("重排：已停用（RERANK_ENABLE=0 或 RERANK_BACKEND=none）", flush=True)
+        else:
+            from reranker import probe_availability
+
+            avail = probe_availability()
+            print(f"重排 CrossEncoder：{'可用' if avail.get('crossencoder') else '不可用'}", flush=True)
+            print(f"重排 LLM 備援：{'可用' if avail.get('llm') else '不可用'}", flush=True)
+            if not avail.get("crossencoder") and not avail.get("llm"):
+                ok = False
     except Exception as e:
         print(f"重排探測失敗：{e}", flush=True)
         ok = False
@@ -191,6 +229,20 @@ def _run_health_check(model: str) -> int:
         print(f"Qdrant：可用（{url}，收藏集：{', '.join(names) if names else '無'}）", flush=True)
     except Exception as e:
         print(f"Qdrant：不可用（{e}）", flush=True)
+        ok = False
+    try:
+        root = _core._workspace_root()
+        probe = root / ".health_probe"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+        finally:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+        print(f"工作區：可用（{root}）", flush=True)
+    except Exception as e:
+        print(f"工作區：不可用（{e}）", flush=True)
         ok = False
     print(f"聊天模型：{model}（啟動後實際對話時驗證）", flush=True)
     return 0 if ok else 1
@@ -214,14 +266,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.health:
         raise SystemExit(_run_health_check(args.model))
     model = args.model
-    search_g = not args.no_search
+    web_search = not args.no_search
     # 優化：獨立會話狀態，不再共用全域；--no-history 用完即丟
     state = ChatState()
     if not args.no_history:
         _load_history(state)
         # 相容舊寫法：把載入的歷史同步給全域，舊外掛讀 hist 不會空
         _core.hist.extend([m for m in state.hist if m not in _core.hist])
-    print(f"小助理已啟動（模型：{model}，搜尋：{'開' if search_g else '關'}），輸入 q 可離開。", flush=True)
+    print(f"小助理已啟動（模型：{model}，上網搜尋：{'開' if web_search else '關'}），輸入 q 可離開，/ingest 可匯入筆記。", flush=True)
     # P12 體感：有 prompt_toolkit 走歷史上下鍵＋持久歷史，缺套件退化 input
     _prompt = None
     try:
@@ -232,6 +284,7 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         _prompt = None
     def _ask() -> str:
+        """讀一句輸入：有 prompt_toolkit 走上下鍵歷史，缺套件退化 input。」"""
         if _prompt is not None:
             try:
                 return _prompt.prompt("你說：")
@@ -253,9 +306,12 @@ def main(argv: list[str] | None = None) -> None:
             if text.lower() in _QUIT_CMDS:
                 print("再見！", flush=True)
                 break
+            if text == "/ingest" or text.startswith("/ingest "):
+                _run_ingest_command(text)
+                continue
             print("小助理：", end="", flush=True)
             try:
-                for reply in chat_w(sys_msg, text, search_g=search_g, model=model, state=state):
+                for reply in chat_w(sys_msg, text, search_g=True, web_search=web_search, model=model, state=state):
                     print(reply, end="", flush=True)
             except KeyboardInterrupt:
                 print("\n[已中斷本次回答]", flush=True)

@@ -55,6 +55,7 @@ class RAGConfig:
     embed_batch: int = _config.EMBED_BATCH
     upsert_batch: int = _config.UPSERT_BATCH
     chunk_max_tokens: int = _config.CHUNK_MAX_TOKENS
+    query_max_chars: int = _config.RAG_QUERY_MAX_CHARS
     image_max_mb: int = _config.INGEST_IMAGE_MAX_MB
     pdf_max_pages: int = _config.INGEST_PDF_MAX_PAGES
     csv_max_rows: int = _config.INGEST_CSV_MAX_ROWS
@@ -64,8 +65,13 @@ class RAGConfig:
 
 _CONFIG = RAGConfig()
 
-# 優化：建立帶逾時的共用 client，避免 ollama.embed/chat 卡死
-_ollama = ollama.Client(timeout=_CONFIG.timeout)
+# 優化：共用 ollama client（三模組同 timeout 共用一份連線池，見 ollama_shared.py）
+try:
+    from ollama_shared import get_shared_client as _get_shared_client
+
+    _ollama = _get_shared_client(_CONFIG.timeout)
+except Exception:  # BROAD_EXCEPT_OK - 共用模組缺失時退化為直建，不影響嵌入
+    _ollama = ollama.Client(timeout=_CONFIG.timeout)
 _ollama_timeout_used: float = _CONFIG.timeout  # P14：記住目前 client 用的逾時，沒變就不重建
 
 
@@ -90,6 +96,7 @@ def _sync_config() -> None:
             embed_batch=_config.EMBED_BATCH,
             upsert_batch=_config.UPSERT_BATCH,
             chunk_max_tokens=_config.CHUNK_MAX_TOKENS,
+            query_max_chars=_config.RAG_QUERY_MAX_CHARS,
             image_max_mb=_config.INGEST_IMAGE_MAX_MB,
             pdf_max_pages=_config.INGEST_PDF_MAX_PAGES,
             csv_max_rows=_config.INGEST_CSV_MAX_ROWS,
@@ -98,6 +105,8 @@ def _sync_config() -> None:
         )
         _QUERY_VEC_CACHE.update_limits(_config.QUERY_VEC_CACHE_MAX, _config.QUERY_VEC_CACHE_TTL)
         if _ollama_timeout_used != _CONFIG.timeout:
+            # P17：經 ollama 模組建（與 chat_core 同款生命週期），再登記共用；
+            # 共用快取內的舊實例不關閉，非託管才關。
             old = _ollama
             try:
                 _ollama = ollama.Client(timeout=_CONFIG.timeout)
@@ -105,7 +114,15 @@ def _sync_config() -> None:
             except Exception:
                 _ollama = old  # 建不出新的就沿用舊的，別讓嵌入斷炊
             else:
-                if old is not None:
+                try:
+                    from ollama_shared import is_managed as _is_managed
+                    from ollama_shared import remember as _remember_shared
+
+                    _remember_shared(_CONFIG.timeout, _ollama)
+                    managed = _is_managed(old)
+                except Exception:
+                    managed = False
+                if old is not None and old is not _ollama and not managed:
                     try:
                         old.close()
                     except Exception:
@@ -134,6 +151,7 @@ except Exception as _e:  # BROAD_EXCEPT_OK - reranker 缺失時仍要能純向�
     logger.warning("reranker 載入失敗（%s），降級為純向量排序", _e)
 
     def _rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[str, str]]:
+        """reranker 缺失時的降級版：不重排，直接回向量原順序前 top_k。」"""
         logger.warning("reranker 不可用，本次查詢使用向量原順序")
         return docs[:top_k]
 
@@ -224,12 +242,19 @@ def _tok_len(text: str) -> int:
 
 
 def _over_budget(buf: str, chunk_chars: int, chunk_tokens: int) -> bool:
-    """字元或 token 任一超標即算滿｜新手：體積跟重量哪個先超重就切。」"""
-    if len(buf) > chunk_chars:
+    """字元或 token 任一超標即算滿｜新手：體積跟重量哪個先超重就切。
+
+    P17 快徑：小 buf 直接用字數判斷，不調 tiktoken 全編碼；
+    中文 cl100k 約 1 字 1~2 token，字數 2 倍仍低於 token 上限時必定未超。
+    """
+    n = len(buf)
+    if n > chunk_chars:
         return True
-    if chunk_tokens > 0 and _tok_len(buf) > chunk_tokens:
-        return True
-    return False
+    if chunk_tokens <= 0:
+        return False
+    if n * 2 < chunk_tokens:
+        return False
+    return _tok_len(buf) > chunk_tokens
 
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;…])\s*")
@@ -345,17 +370,37 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 def _embed_with_order(texts: list[str]) -> dict[int, list[float]]:
-    """保序嵌入，單次遞迴不重複計費｜新手：壞掉那張空著，別整疊重印兩次。」"""
+    """保序嵌入，單次遞迴不重複計費｜新手：壞掉那張空著，別整疊重印兩次。
+
+    P17 同文去重：同批相同文字只嵌一次再扇出（如跨檔授權頭），省 embed 呼叫。
+    """
     out: dict[int, list[float]] = {}
+    if not texts:
+        return out
+    # 同文分組：uniq_texts 只嵌一次，groups 記回填位置
+    uniq: list[str] = []
+    index_of: dict[str, int] = {}
+    groups: dict[int, list[int]] = {}
+    for i, t in enumerate(texts):
+        u = index_of.get(t)
+        if u is None:
+            u = len(uniq)
+            index_of[t] = u
+            uniq.append(t)
+            groups[u] = [i]
+        else:
+            groups[u].append(i)
 
     def _rec(indexed: list[tuple[int, str]]) -> None:
+        """遞迴切半：整批失敗拆兩半重試，單塊失敗丟棄不影響整批。」"""
         if not indexed:
             return
         batch = [t for _, t in indexed]
         ok = _embed_single_batch(batch)
         if ok is not None and len(ok) == len(indexed):
-            for (idx, _), vec in zip(indexed, ok):
-                out[idx] = vec
+            for (u_idx, _), vec in zip(indexed, ok):
+                for orig_i in groups[u_idx]:
+                    out[orig_i] = vec
             return
         if len(indexed) == 1:
             return  # 單塊失敗已記 log，直接丟棄
@@ -363,7 +408,7 @@ def _embed_with_order(texts: list[str]) -> dict[int, list[float]]:
         _rec(indexed[:mid])
         _rec(indexed[mid:])
 
-    _rec(list(enumerate(texts)))
+    _rec(list(enumerate(uniq)))
     return out
 
 
@@ -604,9 +649,12 @@ def _load_ingest_cache(root: Path) -> dict[str, dict[str, object]]:
 
 
 def _save_ingest_cache(root: Path, cache: dict[str, dict[str, object]]) -> None:
-    """寫檔案級快取，失敗僅警告不中斷匯入。」"""
+    """原子寫檔案級快取（tmp＋replace 防半寫，半路斷電不留壞檔），失敗僅警告不中斷匯入。」"""
     try:
-        (root / _INGEST_CACHE_NAME).write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        p = root / _INGEST_CACHE_NAME
+        tmp = root / (_INGEST_CACHE_NAME + ".tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
     except Exception as e:
         logger.warning("匯入快取寫入失敗：%s", e)
 
@@ -618,6 +666,8 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
     """
     _sync_config()
     root = Path(folder)
+    if not root.is_dir():
+        raise FileNotFoundError(f"匯入資料夾不存在：{folder}")
     files = sorted([p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES and p.is_file() and p.name != _INGEST_CACHE_NAME])
     if not files:
         logger.warning("%s 內沒有支援的檔案（支援：%s），可先丟筆記進去", folder, sorted(SUPPORTED_SUFFIXES))
@@ -635,6 +685,7 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
     touched: dict[str, dict[str, object]] = {}
 
     def _drain() -> tuple[int, int]:
+        """清餘批：把暫存塊嵌入寫入並累計計數，回 (寫入數, 跳過數)。」"""
         nonlocal total, skipped_unchanged, pending_chunks, pending_metas
         if not pending_chunks:
             return (0, 0)
@@ -646,6 +697,7 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
         return (written, skipped)
 
     def _report(done: int, rel: str) -> None:
+        """進度回報：調 on_progress 顯示檔數，回調拋錯只警告不中斷。」"""
         if on_progress is None:
             return
         try:
@@ -714,17 +766,21 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
 
 
 def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
-    """把問題轉向量去 Qdrant 找最像的筆記塊，寬取後重排取精華。」"""
+    """把問題轉向量去 Qdrant 找最像的筆記塊，寬取後重排取精華。」
+    P20：limit<=0 直接回空，避免 recall 寬取後掉進 top_k=0 的未定義行為。
+    """
     _sync_config()
+    if limit <= 0:
+        return []
     q = query.strip()
     if not q:
         return []
     try:
-        qvec = _embed_query_vec(q[:500])
+        qvec = _embed_query_vec(q[:_CONFIG.query_max_chars])
         if qvec is None:
             return []
         client = _client()
-        recall = max(limit, _CONFIG.rerank_recall) if limit > 0 else _CONFIG.rerank_recall
+        recall = max(limit, _CONFIG.rerank_recall)
         res = client.query_points(collection_name=_CONFIG.collection, query=qvec, limit=recall, with_payload=True)
         hits: list[dict[str, str]] = []
         for pt in res.points:
@@ -766,9 +822,13 @@ def main() -> None:
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s", force=True)
     if args.ingest:
         def _on_progress(done: int, total: int, rel: str) -> None:
+            """--progress 顯示：逐檔印 [完成/總數] 檔名。」"""
             print(f"[{done}/{total}] {rel}", flush=True)
 
-        ingest_folder(args.ingest, on_progress=_on_progress if args.progress else None)
+        try:
+            ingest_folder(args.ingest, on_progress=_on_progress if args.progress else None)
+        except FileNotFoundError as e:
+            print(f"匯入失敗：{e}")
     elif args.query:
         hits = search_local(args.query, limit=args.limit)
         if not hits:

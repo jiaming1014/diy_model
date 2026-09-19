@@ -10,6 +10,7 @@ from unittest import mock
 
 class TestDocxLimit:
     def test_truncates_paras(self) -> None:
+        """DOCX 超段落上限截斷並註記，避免大檔撐爆記憶體。」"""
         import dataclasses
 
         import rag_qdrant as rq
@@ -27,12 +28,14 @@ class TestDocxLimit:
 
 class TestPerFileOk:
     def test_failed_file_not_marked_ok(self, tmp_path: Path) -> None:
+        """嵌入全失敗的檔不標 ok，下次匯入會重試補寫。」"""
         import rag_qdrant as rq
 
         (tmp_path / "ok.md").write_text("hello world hello", encoding="utf-8")
         (tmp_path / "bad.md").write_text("bad content here", encoding="utf-8")
 
         def _fake_flush(client, chunks, metas, ensured):
+            """假寫入：bad.md 全失敗，其餘全成功。」"""
             if any(m.get("source") == "bad.md" for m in metas):
                 return (0, 0)  # 嵌入全失敗
             return (len(chunks), 0)
@@ -49,6 +52,7 @@ class TestPerFileOk:
 
 class TestSearchRetry:
     def test_retry_succeeds_second(self) -> None:
+        """搜尋失敗重試一次：首炸次成功，回 1 筆且 DDGS 共呼叫 2 次。」"""
         import chat_core
 
         chat_core._SEARCH_CACHE.clear()
@@ -64,6 +68,7 @@ class TestSearchRetry:
 
 class TestCrossModuleSync:
     def test_refresh_propagates(self, monkeypatch) -> None:
+        """config.refresh 把異動傳染三模組快照，免重啟生效。」"""
         import config as c
 
         import chat_core
@@ -80,4 +85,5 @@ class TestCrossModuleSync:
             assert r.RERANK_BATCH == 4
             assert rq._QUERY_VEC_CACHE.maxsize == 11
         finally:
+            monkeypatch.undo()  # 先還原 env 再 refresh，否則快照停在測試值污染後續測試
             c.refresh()

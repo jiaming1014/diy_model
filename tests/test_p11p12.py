@@ -12,10 +12,12 @@ import chat_core
 
 class TestDualBudget:
     def test_tokens_fallback_len(self) -> None:
+        """token 計算有正值：缺 tiktoken 退化字數也不回 0。」"""
         n = chat_core._content_tokens("hello")
         assert n > 0
 
     def test_trim_uses_both(self) -> None:
+        """字數＋token 雙預算任一超標即裁，不無限成長。」"""
         buf = [
             {"role": "user", "content": "字" * 5000},
             {"role": "assistant", "content": "答" * 5000},
@@ -27,6 +29,7 @@ class TestDualBudget:
 
 class TestEvalDual:
     def test_citation_detect(self) -> None:
+        """引用標註偵測：[來源i]／[筆記i] 算有引用，其餘不算。」"""
         from eval import _has_citation
 
         assert _has_citation("根據 [來源1] 回答") is True
@@ -34,6 +37,7 @@ class TestEvalDual:
         assert _has_citation("沒有引用") is False
 
     def test_model_requires_cite_when_evidence(self) -> None:
+        """有外部依據（RAG）卻無引用 → 模型層評分不過。」"""
         from eval import _eval_model
 
         with mock.patch.object(chat_core, "chat_w", return_value=iter(["帶傘"])):
@@ -46,6 +50,7 @@ class TestEvalDual:
 
 class TestStreamRetry:
     def test_retry_succeeds(self) -> None:
+        """串流建立失敗重試一次：第一次炸、第二次串流成功即回內容。」"""
         good = iter([{"message": {"content": "hi"}}])
         with mock.patch.object(chat_core._ollama, "chat", side_effect=[Exception("boom"), good]):
             with mock.patch.object(chat_core.time, "sleep", return_value=None):

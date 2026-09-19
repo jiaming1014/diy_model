@@ -24,11 +24,12 @@ sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAcces
 
 import chat_core
 import config as _config
+from chat_core import DEFAULT_SYS_MSG  # P17：系統提示唯一真相在 chat_core
 from rag_qdrant import search_local
 
 logger = logging.getLogger(__name__)
 
-SYS_MSG = "請透過所提供的資料回答使用者問題，並一律使用繁體中文（台灣用語）回答"
+SYS_MSG = DEFAULT_SYS_MSG  # 相容舊名：值與 chat_core.DEFAULT_SYS_MSG 同一內容
 
 # 固定考題：問題＋回覆裡必須出現的關鍵字
 # model=True 才跑模型層（需觸發 RAG；含「天氣」等即時關鍵字的題目會被

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field  # 把相關狀態包成一包，取代
 from typing import Final, Literal, TypedDict  # Final：約好不改；Literal：限定字串；TypedDict：字典長相
 from typing import NotRequired  # TypedDict 中可有可無的鍵
 from typing import cast  # P16：裁切快照複本時保住 ChatMessage 型別
+from pathlib import Path  # P19：工作區路徑操作共用頂層匯入，不再各函式現 import
 import json  # 解析工具參數（arguments 可能是 JSON 字串）
 import logging  # 取代 print，讓降級訊息可分級、不污染串流輸出
 import random  # 重試抖動用，避免驚群
@@ -42,6 +43,7 @@ try:
     from rag_qdrant import search_local as _rag_search  # 本地筆記向量檢索
 except Exception:  # BROAD_EXCEPT_OK - rag 模組缺失時仍要能純網路問答
     def _rag_search(query: str, limit: int = 3) -> list[dict[str, str]]:
+        """降級空函式：rag 模組缺失時回空命中，對話照走純網路問答。」"""
         return []
 
 import config as _config_module  # P10 即時同步用，保留 from 快照的同時可重讀真相
@@ -61,6 +63,7 @@ from config import QUERY_REWRITE_LLM as QUERY_REWRITE_LLM
 from config import RAG_ENABLE as RAG_ENABLE
 from config import RAG_MAX_CHARS as RAG_MAX_CHARS
 from config import RAG_MAX_RESULTS as RAG_MAX_RESULTS
+from config import SEARCH_FAIL_CACHE_TTL as SEARCH_FAIL_CACHE_TTL
 from config import SEARCH_MAX_CHARS as SEARCH_MAX_CHARS
 from config import SEARCH_MAX_RESULTS as SEARCH_MAX_RESULTS
 from config import SEARCH_QUERY_MAX_CHARS as SEARCH_QUERY_MAX_CHARS
@@ -69,20 +72,32 @@ from config import SEARCH_SNIPPET_CHARS as SEARCH_SNIPPET_CHARS
 from config import SEARCH_TITLE_CHARS as SEARCH_TITLE_CHARS
 from config import SEARCH_TIMEOUT as SEARCH_TIMEOUT
 from config import USER_MAX_CHARS as USER_MAX_CHARS
+from config import WORKSPACE_DIRNAME as WORKSPACE_DIRNAME
+from config import WORKSPACE_MAX_FILE_CHARS as WORKSPACE_MAX_FILE_CHARS
+from config import WORKSPACE_PATH_MAX_CHARS as WORKSPACE_PATH_MAX_CHARS
+from config import YOUTUBE_QUERY_MAX_CHARS as YOUTUBE_QUERY_MAX_CHARS
 
 # --- P16 模組化：純文字規則助手收斂到 text_utils.py，這裡同名重新匯出（舊寫法不變）---
 from text_utils import _clean_query_for_search as _clean_query_for_search
 from text_utils import _current_year as _current_year
+from text_utils import _detect_intent as _detect_intent
 from text_utils import _is_chitchat as _is_chitchat
 from text_utils import _is_date_query as _is_date_query
+from text_utils import _needs_music as _needs_music
 from text_utils import _needs_realtime as _needs_realtime
+from text_utils import _needs_workspace as _needs_workspace
 from text_utils import _normalize_url as _normalize_url
 from text_utils import _strip_edge as _strip_edge
 from text_utils import _today_str as _today_str
 from text_utils import _truncate_user_msg as _truncate_user_msg
 
-# 優化：建立帶逾時的共用 client，避免 ollama.chat 等不到就永遠卡住
-_ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
+# 優化：共用 ollama client（三模組同 timeout 共用一份連線池，見 ollama_shared.py）
+try:
+    from ollama_shared import get_shared_client as _get_shared_client
+
+    _ollama = _get_shared_client(OLLAMA_TIMEOUT)
+except Exception:  # BROAD_EXCEPT_OK - 共用模組缺失時退化為直建，不影響對話
+    _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
 
 
 def _sync_config() -> None:
@@ -96,7 +111,10 @@ def _sync_config() -> None:
     global RAG_MAX_RESULTS
     global SEARCH_MAX_CHARS, SEARCH_MAX_RESULTS, SEARCH_QUERY_MAX_CHARS, SEARCH_REGION
     global SEARCH_SNIPPET_CHARS, SEARCH_TITLE_CHARS, SEARCH_TIMEOUT
+    global SEARCH_FAIL_CACHE_TTL
     global USER_MAX_CHARS, _ollama
+    global WORKSPACE_DIRNAME, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_PATH_MAX_CHARS
+    global YOUTUBE_QUERY_MAX_CHARS
     try:
         _m = _config_module
         HIST_MAX_CHARS = _m.HIST_MAX_CHARS
@@ -118,18 +136,33 @@ def _sync_config() -> None:
         SEARCH_SNIPPET_CHARS = _m.SEARCH_SNIPPET_CHARS
         SEARCH_TITLE_CHARS = _m.SEARCH_TITLE_CHARS
         SEARCH_TIMEOUT = _m.SEARCH_TIMEOUT
+        SEARCH_FAIL_CACHE_TTL = _m.SEARCH_FAIL_CACHE_TTL
         USER_MAX_CHARS = _m.USER_MAX_CHARS
+        WORKSPACE_DIRNAME = _m.WORKSPACE_DIRNAME
+        WORKSPACE_MAX_FILE_CHARS = _m.WORKSPACE_MAX_FILE_CHARS
+        WORKSPACE_PATH_MAX_CHARS = _m.WORKSPACE_PATH_MAX_CHARS
+        YOUTUBE_QUERY_MAX_CHARS = _m.YOUTUBE_QUERY_MAX_CHARS
+        _invalidate_workspace_root()  # 工作區改名即換根，舊快取不可留
         if OLLAMA_TIMEOUT != _m.OLLAMA_TIMEOUT:
             OLLAMA_TIMEOUT = _m.OLLAMA_TIMEOUT
             old = _ollama
             try:
+                # 經 ollama 模組建（測試可 mock chat_core.ollama.Client），再登記共用
                 _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
             except Exception as e:
                 _ollama = old  # 建不出新的就沿用舊的，別讓聊天斷炊
                 logger.warning("重建 Ollama client 失敗，沿用舊的：%s", e)
             else:
-                # P15：與 rag_qdrant／reranker 同款生命週期管理，換新前先關舊
-                if old is not None:
+                # P17：共用快取內的實例不關閉（可能他處仍在用）；非託管舊實例才關
+                try:
+                    from ollama_shared import is_managed as _is_managed
+                    from ollama_shared import remember as _remember_shared
+
+                    _remember_shared(OLLAMA_TIMEOUT, _ollama)
+                    managed = _is_managed(old)
+                except Exception:
+                    managed = False
+                if old is not None and old is not _ollama and not managed:
                     try:
                         old.close()
                     except Exception:
@@ -139,6 +172,9 @@ def _sync_config() -> None:
 
 Role = Literal["system", "user", "assistant", "tool"]
 ToolCall = tuple[str, dict[str, object]]  # (工具名, {參數名: 參數值})，保留原始型別以支援數字／布林
+
+# P17：系統提示唯一真相，chat_cli／eval 共用此常數，避免三處漂移
+DEFAULT_SYS_MSG: Final[str] = "請透過所提供的資料回答使用者問題，並一律使用繁體中文（台灣用語）回答"
 
 
 class ChatMessage(TypedDict):
@@ -171,8 +207,6 @@ class ChatState:
 _default_state = ChatState()  # 預設會話，chat_w 未傳 state 時使用（相容舊匯入）
 hist: list[ChatMessage] = _default_state.hist  # 相容別名：與 _default_state.hist 同一物件，請勿重綁
 backtrace: Final[int] = 4
-_last_sources: list[SearchResult] = _default_state.last_sources  # 相容別名：同物件，原地修改
-_last_rag: list[dict[str, str]] = _default_state.last_rag  # 相容別名：同物件，原地修改
 _hist_lock = threading.Lock()
 # P14：搜尋結果快取改用共用 TTLCache（原雙字典＋鎖已收斂進 ttl_cache.py）
 _SEARCH_CACHE: TTLCache[list[SearchResult]] = TTLCache(
@@ -196,13 +230,51 @@ def _sync_live_tools(cached: list[dict[str, object]]) -> list[dict[str, object]]
         return _TOOLS_LIVE
 
 
-def _tools() -> list[dict[str, object]]:
-    """動態產生工具清單，年份隨現在走，但同一 session 內只算一次。」"""
+# P19 意圖→工具子集：偵測到明確意圖只給相關工具，省上下文＋降選錯；偵測不到全給。
+_INTENT_TOOL_NAMES: Final[dict[str, frozenset[str]]] = {
+    "music": frozenset({"play_youtube_music", "search_web"}),
+    "workspace": frozenset({"workspace_write_file", "workspace_make_dir", "search_web", "get_today"}),
+}
+
+
+def _tool_name(tool: dict[str, object]) -> str:
+    """取工具宣告的名稱，格式壞掉回空字串（過濾時自動剔除）。"""
+    try:
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            return str(name) if name else ""
+        return ""
+    except Exception:
+        return ""
+
+
+def _filter_tools(base: list[dict[str, object]], allow_search: bool, intent: str | None) -> list[dict[str, object]]:
+    """按開關與意圖過濾工具清單；無過濾需求回原清單（保住 TOOLS 單例）。"""
+    if allow_search and intent is None:
+        return base
+    if intent is not None:
+        keep = _INTENT_TOOL_NAMES.get(intent, frozenset(_tool_name(t) for t in base))
+    else:
+        keep = frozenset(_tool_name(t) for t in base)
+    if not allow_search:
+        keep = keep - {"search_web"}
+    if len(keep) >= len(base):
+        return base
+    return [t for t in base if _tool_name(t) in keep]
+
+
+def _tools(allow_search: bool = True, intent: str | None = None) -> list[dict[str, object]]:
+    """動態產生工具清單，年份隨現在走，但同一 session 內只算一次。
+
+    P19：allow_search=False 剔 search_web（--no-search 用）；intent 命中
+    music／workspace 只給子集；無參數呼叫行為與舊版完全一致。
+    """
     year = _current_year()
     with _tools_lock:
         cached = _tools_cache.get(year)
     if cached is not None:
-        return _sync_live_tools(cached)
+        return _filter_tools(_sync_live_tools(cached), allow_search, intent)
     tools = [
         {
             "type": "function",
@@ -226,10 +298,53 @@ def _tools() -> list[dict[str, object]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "play_youtube_music",
+                "description": "想聽音樂、在 YouTube 播歌時呼叫。用關鍵字開 YouTube 搜尋頁，不要拿來查一般資料。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "歌曲或歌手關鍵字，例如 周杰倫 晴天"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workspace_write_file",
+                "description": "在桌面 AI_Workspace 內新增或整檔覆寫檔案。path 用相對路徑，例如 報告/草稿.md；content 為全文。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "AI_Workspace 內的相對路徑，例如 報告/草稿.md"},
+                        "content": {"type": "string", "description": "要寫入的全文"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workspace_make_dir",
+                "description": "在桌面 AI_Workspace 內新增資料夾，可多層。path 用相對路徑，例如 報告/2026。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "AI_Workspace 內的相對路徑，例如 報告/2026"},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
     ]
     with _tools_lock:
         _tools_cache[year] = tools
-    return _sync_live_tools(tools)
+    return _filter_tools(_sync_live_tools(tools), allow_search, intent)
 
 
 # 保留舊常數名供外部匯入，內容動態產生（與 _TOOLS_LIVE 同一物件，原地更新）
@@ -378,9 +493,12 @@ def _cache_get(key: str) -> list[SearchResult] | None:
     return list(hit) if hit is not None else None
 
 
-def _cache_put(key: str, value: list[SearchResult]) -> None:
-    """共用 TTL 快取寫入（存複本），超量淘汰最久未用；內部順手清過期。」"""
-    _SEARCH_CACHE.put(key, list(value))
+def _cache_put(key: str, value: list[SearchResult], ttl: float | None = None) -> None:
+    """共用 TTL 快取寫入（存複本），超量淘汰最久未用；內部順手清過期。
+
+    P18：ttl 單筆覆寫，搜尋失敗空結果短快取用，不帶沿用預設。
+    """
+    _SEARCH_CACHE.put(key, list(value), ttl=ttl)
 
 
 # P16：_truncate_user_msg／_clean_query_for_search／_normalize_url 已搬至 text_utils.py（同名重新匯出）
@@ -398,11 +516,12 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
     short_query = _clean_query_for_search(query)
     if not short_query:
         return []
-    cache_key = f"{max_results}::{short_query}"  # P16：不同筆數不共用同一格快取
+    cache_key = f"{max_results}::{SEARCH_REGION}::{short_query}"  # P17：不同筆數／地區不共用同一格快取
     cached = _cache_get(cache_key)
     if cached is not None:
         with _hist_lock:
             st.last_sources.extend(cached)
+        logger.debug("觀測 搜尋快取命中 stats=%s", _SEARCH_CACHE.stats())
         return list(cached)
     raw: list[dict] = []
     for attempt in range(2):
@@ -420,6 +539,8 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
                 time.sleep(random.uniform(0.2, 0.5))
                 continue
             logger.warning("網頁搜尋失敗，已降級為無結果")
+            # P18：失敗空結果短快取，壞查詢短時間內不再打網路（TTL 見 SEARCH_FAIL_CACHE_TTL）
+            _cache_put(cache_key, [], ttl=SEARCH_FAIL_CACHE_TTL)
             return []
     results: list[SearchResult] = []
     seen: set[str] = set()
@@ -436,7 +557,9 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
         results.append({"title": title, "snippet": snippet, "url": url})
     with _hist_lock:
         st.last_sources.extend(results)
-    _cache_put(cache_key, results)
+    # P19：成功但 0 筆與失敗同視，短快取避免舊的「無結果」殘留過久
+    _cache_put(cache_key, results, ttl=SEARCH_FAIL_CACHE_TTL if not results else None)
+    logger.debug("觀測 搜尋快取寫入 筆數=%d stats=%s", len(results), _SEARCH_CACHE.stats())
     return results
 
 
@@ -544,11 +667,6 @@ def _format_search_results(results: list[SearchResult]) -> str:
     return "\n\n".join(lines)
 
 
-def _extract_tool_calls(message: object) -> list[ToolCall]:
-    """相容 dict 與物件兩種回傳，取出 (工具名, 參數)。"""
-    return _extract_tool_calls_raw(_get_field(message, "tool_calls"))
-
-
 def _extract_tool_calls_raw(raw_calls: object) -> list[ToolCall]:
     """把原始 tool_calls 清單正規化為 (工具名, 參數 dict)。
 
@@ -586,14 +704,116 @@ def _assistant_text(message: object) -> str:
     return str(raw) if raw is not None else ""
 
 
-def _run_tool(name: str, args: dict[str, object], user_msg: str, state: ChatState | None = None) -> str:
-    """執行單一工具，回傳餵給模型的文字結果。」"""
+# P20 安全：工作區拒寫可執行檔，防提示詞注入丟惡意程式到桌面（政策寫死不開放旋鈕）
+_WORKSPACE_BLOCKED_EXTS: Final[frozenset[str]] = frozenset({
+    ".exe", ".bat", ".cmd", ".com", ".ps1", ".psm1", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".scr", ".msi", ".pif", ".reg", ".lnk",
+})
+# P19：工作區根快取（設定值唯一真相在 config.py，改名後由 _sync_config 清掉）
+_workspace_root_cache: Path | None = None
+_workspace_lock = threading.Lock()
+
+
+def _invalidate_workspace_root() -> None:
+    """清掉工作區根快取，下次取用按新設定重建（config.refresh 用）。"""
+    global _workspace_root_cache
+    with _workspace_lock:
+        _workspace_root_cache = None
+
+
+def _workspace_root() -> Path:
+    """桌面工作區根目錄，不存在即建｜新手：只准在這個沙盒玩沙。」"""
+    global _workspace_root_cache
+    with _workspace_lock:
+        cached = _workspace_root_cache
+        if cached is not None and cached.exists():
+            return cached
+        root = Path.home() / "Desktop" / WORKSPACE_DIRNAME
+        root.mkdir(parents=True, exist_ok=True)
+        _workspace_root_cache = root
+        return root
+
+
+def _resolve_workspace_path(rel: str) -> tuple[Path | None, str | None]:
+    """把相對路徑關進工作區，成功回 (target, None)，失敗回 (None, 錯誤訊息)。"""
+    raw = (rel or "").strip().replace("\x00", "")
+    if not raw:
+        return None, "路徑為空，請提供工作區內的相對路徑，例如 報告/草稿.md。"
+    if len(raw) > WORKSPACE_PATH_MAX_CHARS:
+        return None, f"路徑太長，請控制在 {WORKSPACE_PATH_MAX_CHARS} 字元內。"
+    p = Path(raw)
+    if p.is_absolute() or raw.startswith(("~", "$", "%")):
+        return None, "只接受工作區內的相對路徑，不接受絕對路徑。"
+    root = _workspace_root()
+    target = (root / p).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return None, "路徑穿越被擋下，只能操作工作區內。"
+    return target, None
+
+
+def _run_tool(name: str, args: dict[str, object], user_msg: str, state: ChatState | None = None, allow_web_search: bool = True) -> str:
+    """執行單一工具，回傳餵給模型的文字結果。
+
+    P20：allow_web_search=False 時硬擋 search_web（子集已拿掉清單，幻覺呼叫也擋）。
+    """
     if name == "get_today":
         return f"今天是 {_today_str()}（台灣時間）。"
     if name == "search_web":
+        if not allow_web_search:
+            return "上網搜尋已關閉（--no-search），請用既有資料直接回答使用者問題。"
         raw_q = args.get("query", user_msg)
         query = (str(raw_q).strip() if raw_q is not None else "") or user_msg
         return _format_search_results(_search_web(query, state=state))
+    if name == "play_youtube_music":
+        import urllib.parse
+        import webbrowser
+
+        q = str(args.get("query", "") or "").strip() or user_msg.strip()
+        q = q[:YOUTUBE_QUERY_MAX_CHARS]
+        if not q:
+            return "沒收到歌曲關鍵字，請說要聽哪首歌。"
+        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+        try:
+            opened = webbrowser.open(url)
+        except Exception as e:  # BROAD_EXCEPT_OK - 開瀏覽器失敗轉文字讓模型轉述
+            return f"開啟失敗，請手動開此連結：{url}（{e}）"
+        if opened:
+            return f"已在瀏覽器開啟 YouTube 搜尋「{q}」，請按第一個結果播放：{url}"
+        return f"瀏覽器沒有反應，請手動開此連結：{url}"
+    if name == "workspace_write_file":
+        rel = str(args.get("path", "") or "")
+        content = str(args.get("content", "") or "")
+        if len(content) > WORKSPACE_MAX_FILE_CHARS:
+            return f"內容太長（{len(content)} 字），上限 {WORKSPACE_MAX_FILE_CHARS} 字，請分多次寫入。"
+        target, err = _resolve_workspace_path(rel)
+        if err is not None or target is None:
+            return err or "路徑無效。"
+        if target.suffix.lower() in _WORKSPACE_BLOCKED_EXTS:
+            return f"為安全起見，工作區不接受可執行檔（{target.suffix}），請改用文件格式如 .md／.txt。"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            return (
+                f"已寫入 {WORKSPACE_DIRNAME}/{target.relative_to(_workspace_root())}（{len(content)} 字）。"
+                f"想讓之後的對話查到它，可執行：python rag_qdrant.py --ingest \"{_workspace_root()}\" --progress"
+                "（注意：會與個人筆記混在同一收藏集）"
+            )
+        except Exception as e:  # BROAD_EXCEPT_OK - 權限等系統錯誤轉文字讓模型轉述
+            return f"寫入失敗：{e}"
+    if name == "workspace_make_dir":
+        rel = str(args.get("path", "") or "")
+        target, err = _resolve_workspace_path(rel)
+        if err is not None or target is None:
+            return err or "路徑無效。"
+        try:
+            target.mkdir(parents=True, exist_ok=False)
+            return f"已在 {WORKSPACE_DIRNAME} 內建立資料夾：{target.relative_to(_workspace_root())}"
+        except FileExistsError:
+            return "該資料夾已存在，未重複建立。"
+        except Exception as e:  # BROAD_EXCEPT_OK - 權限等系統錯誤轉文字讓模型轉述
+            return f"建立失敗：{e}"
     logger.warning("收到未知工具呼叫：%s，已要求模型直接回答", name)
     return f"未知工具：{name}，請直接回答使用者問題。"
 
@@ -616,7 +836,9 @@ def _call_chat_with_retry(messages: list[ChatMessage], model: str, tools: list[d
             logger.warning("ollama.chat 第 %d 次失敗：%s", attempt + 1, e)
             if attempt < OLLAMA_RETRIES:
                 time.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.2))
-    assert last_err is not None
+    if last_err is None:
+        # P22：OLLAMA_RETRIES 負數時迴圈不跑，明確報錯（assert 在 -O 會被剝除成 raise None）
+        raise RuntimeError("OLLAMA_RETRIES 設定無效（無任何重試嘗試），請設為 >= 0")
     raise last_err
 
 
@@ -722,12 +944,18 @@ def _tool_call_key(name: str, args: dict[str, object]) -> tuple:
         return (name, str(sorted(args.items())))
 
 
-def _needs_pre_search(user_msg: str, rag_hits: list[dict[str, str]] | None, rag_block: str, state: ChatState | None = None) -> bool:
+def _needs_pre_search(user_msg: str, rag_hits: list[dict[str, str]] | None, rag_block: str, state: ChatState | None = None, allow_web_search: bool = True, intent: str | None = None) -> bool:
     """是否需要在模型開跑前先補一次網路搜尋。
 
     舊版是「等模型決定不查、且本地不夠」才補搜，但串流流程無法回頭；
     P15 改成開跑前預判：本地筆記不夠力（或明確要即時資料且尚無來源）就先補。閒聊永不補搜。
+    P19：allow_web_search=False（--no-search）直接不補搜，搜尋工具也不會出現在清單。
+    P21：intent 命中（寫檔／播歌）不補搜，命令句拿去搜只是浪費並污染來源。
     """
+    if not allow_web_search:
+        return False
+    if intent is not None:
+        return False
     if _is_chitchat(user_msg):
         return False
     st = _resolve_state(state)
@@ -756,26 +984,29 @@ def _with_fresh_facts(base: list[ChatMessage], user_msg: str, today: str, rag_bl
     return _with_history(sys_with_date, state, content)
 
 
-def _tool_flow(base: list[ChatMessage], user_msg: str, today: str, rag_block: str, use_model: str, state: ChatState | None = None, rag_hits: list[dict[str, str]] | None = None) -> Iterator[str]:
+def _tool_flow(base: list[ChatMessage], user_msg: str, today: str, rag_block: str, use_model: str, state: ChatState | None = None, rag_hits: list[dict[str, str]] | None = None, allow_web_search: bool = True, intent: str | None = None) -> Iterator[str]:
     """串流工具流程：需要時先補搜 → 每輪邊串流邊偵測工具 → 直接完成。
 
     P15：模型沒呼叫工具的那一輪，串流內容就是最終答案（舊版會丟掉再重生一次）；
     只有真的要繼續呼叫工具，才把該輪 assistant 訊息與工具結果接進下一輪。
+    P19：allow_web_search=False 不補搜且不給 search_web；intent 命中只給子集。
     """
     st = _resolve_state(state)
     messages: list[ChatMessage] = list(base)
-    if _needs_pre_search(user_msg, rag_hits, rag_block, state=st):
+    if _needs_pre_search(user_msg, rag_hits, rag_block, state=st, allow_web_search=allow_web_search, intent=intent):
         messages = _with_fresh_facts(messages, user_msg, today, rag_block, st)
     seen: set[tuple] = set()
     for _ in range(MAX_TOOL_ROUNDS):
         calls_out: list[object] = []
         parts: list[str] = []
-        for piece in _stream_chat(messages, use_model, tools=_tools(), calls_out=calls_out):
+        for piece in _stream_chat(messages, use_model, tools=_tools(allow_search=allow_web_search, intent=intent), calls_out=calls_out):
             parts.append(piece)
             yield piece
         calls = _extract_tool_calls_raw(calls_out)
         if not calls:
-            _remember(user_msg, "".join(parts), state=st, model=use_model)
+            # P20：空回覆（Ollama 全掛）不記歷史，避免空字串佔預算污染上下文
+            if parts:
+                _remember(user_msg, "".join(parts), state=st, model=use_model)
             return
         # 同名同參去重：同一輪重複只跑一次，跨輪重複也擋掉
         fresh: list[ToolCall] = []
@@ -793,13 +1024,14 @@ def _tool_flow(base: list[ChatMessage], user_msg: str, today: str, rag_block: st
             tool_msg["tool_calls"] = list(calls_out)
         messages.append(tool_msg)
         for tool_name, tool_args in fresh:
-            messages.append({"role": "tool", "content": _run_tool(tool_name, tool_args, user_msg, state=st)})
-    # 回合用盡或全重複：最後一輪不帶工具，串流收尾
+            messages.append({"role": "tool", "content": _run_tool(tool_name, tool_args, user_msg, state=st, allow_web_search=allow_web_search)})
+    # 回合用盡或全重複：最後一輪不帶工具，串流收尾（空回覆不記歷史，同上）
     reply_full = ""
     for piece in _stream_reply(messages, model=use_model):
         reply_full += piece
         yield piece
-    _remember(user_msg, reply_full, state=st, model=use_model)
+    if reply_full:
+        _remember(user_msg, reply_full, state=st, model=use_model)
 
 
 def _rag_threshold() -> float:
@@ -867,7 +1099,8 @@ def _handle_legacy_flow(sys_msg: str, user_msg: str, today: str, use_model: str,
     for reply in _stream_reply(_with_history(sys_with_date, st, content), model=use_model):
         reply_full += reply
         yield reply
-    _remember(user_msg, reply_full, state=st, model=use_model)
+    if reply_full:
+        _remember(user_msg, reply_full, state=st, model=use_model)
 
 
 def _handle_date_query(user_msg: str, state: ChatState | None = None) -> str:
@@ -878,10 +1111,12 @@ def _handle_date_query(user_msg: str, state: ChatState | None = None) -> str:
     return reply_full
 
 
-def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None = None, state: ChatState | None = None) -> Iterator[str]:
+def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None = None, state: ChatState | None = None, web_search: bool = True) -> Iterator[str]:
     """主聊天函式（產生器）：日期捷徑→工具流程→傳統降級，最後串流回傳並記入歷史。
 
     state 為 None 用全域預設（相容舊呼叫），傳入 ChatState 即多會話隔離。
+    P19：web_search=False 只關上網搜尋（不補搜、不給 search_web），本機寫檔、
+    播音樂、查日期照常；search_g=False 維持舊語意（整段工具流程關閉，走傳統路）。
     """
     _sync_config()
     st = _resolve_state(state)
@@ -900,19 +1135,20 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
     # 優化：明確要求即時資料的問句，跳過本地筆記檢索（RAG + reranker），直接進工具／搜尋流程
     # 本地筆記通常沒有新聞、股價、天氣等即時內容；先搜網更快且答案更新
     realtime = _needs_realtime(user_msg)  # P14：同一輪只算一次，日誌不再重複計算
-    if realtime:
+    intent = _detect_intent(user_msg)  # P19：寫檔／播音樂同樣跳過 RAG，省一次嵌入＋Qdrant
+    if realtime or intent is not None:
         rag_hits: list[dict[str, str]] = []
     else:
         rag_hits = _retrieve_rag(user_msg, state=st, model=use_model)
     rag_ms = (time.perf_counter() - t0) * 1000
     rag_block = _format_rag_results(rag_hits)
     base = _build_base_messages(sys_msg, user_msg, today, rag_block, state=st)
-    logger.debug("觀測 rag_hits=%d rag_ms=%.1f realtime=%s", len(rag_hits), rag_ms, realtime)
+    logger.debug("觀測 rag_hits=%d rag_ms=%.1f realtime=%s intent=%s", len(rag_hits), rag_ms, realtime, intent)
     if search_g is True:
         t1 = time.perf_counter()
         pieces: list[str] = []
         try:
-            for piece in _tool_flow(base, user_msg, today, rag_block, use_model, state=st, rag_hits=rag_hits):
+            for piece in _tool_flow(base, user_msg, today, rag_block, use_model, state=st, rag_hits=rag_hits, allow_web_search=web_search, intent=intent):
                 pieces.append(piece)
                 yield piece
         except Exception as e:  # BROAD_EXCEPT_OK - 工具流程失敗降級為傳統流程

@@ -60,6 +60,7 @@ class TestChatToolFlow:
         calls: list = []
 
         def fake_chat(**kw):
+            """假模型：首輪回工具呼叫，次輪回答案片。」"""
             calls.append(kw)
             if len(calls) == 1:
                 tc = {"function": {"name": "search_web", "arguments": '{"query": "測試"}'}}
@@ -114,7 +115,9 @@ class TestRerankFallback:
 # ------------------------------------------------------------
 class TestResolveModel:
     def test_default_uses_ollama_model(self) -> None:
+        """未指定模型走 OLLAMA_MODEL 預設。」"""
         assert chat_core._resolve_model(None) == chat_core.OLLAMA_MODEL
 
     def test_explicit_overrides(self) -> None:
+        """指定模型優先於預設。」"""
         assert chat_core._resolve_model("custom") == "custom"

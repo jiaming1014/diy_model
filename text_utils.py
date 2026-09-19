@@ -46,6 +46,24 @@ _REALTIME_KEYWORDS: Final[tuple[str, ...]] = (
 _LOCAL_KEYWORDS: Final[tuple[str, ...]] = (
     "筆記", "專案", "資料夾", "嵌入", "收藏", "本地", "notes",
 )
+# P19 工具意圖：工作區檔案操作，命中即跳過 RAG（本地筆記幫不上寫檔）
+# P22 收緊：拿掉過寬的「寫一」「存到」，避免「寫一封信」「存到哪」誤判為寫檔請求
+_WORKSPACE_KEYWORDS: Final[tuple[str, ...]] = (
+    "ai_workspace", "ai workspace", "工作區",
+    "新增檔案", "建立檔案", "修改檔案", "寫入檔案", "寫成檔案", "存成檔案", "轉成檔案",
+    "新增資料夾", "建立資料夾", "建資料夾",
+    "寫個", "存成", "存檔",
+)
+# P19 工具意圖：音樂播放，命中即跳過 RAG（聽歌不需翻筆記）
+_MUSIC_KEYWORDS: Final[tuple[str, ...]] = (
+    "youtube", "油管",
+    "播歌", "放歌", "聽歌", "放首",
+    "首歌", "歌曲", "單曲",
+    "播音樂", "放音樂", "聽音樂", "播放音樂",
+)
+# P22 補漏判：播放動詞＋音樂名詞的組合也算，涵蓋「播周杰倫的歌」等常見說法
+_MUSIC_PLAY_VERBS: Final[tuple[str, ...]] = ("播", "點", "放", "聽")
+_MUSIC_NOUNS: Final[tuple[str, ...]] = ("歌", "音樂", "單曲", "專輯", "youtube", "油管")
 _STRIP_EDGE_RE: Final[re.Pattern[str]] = re.compile(r"^[\s，。！？、；：,.!?;:～~\-—]+|[\s，。！？、；：,.!?;:～~\-—]+$")
 _QUERY_FILLER_RE: Final[re.Pattern[str]] = re.compile(
     r"^(請問|請問一下|幫我查一下|幫我找一下|查一下|找一下|謝謝|麻煩)[，,。\s]*|[？?！!啊呢吧喔哦]+$"
@@ -139,3 +157,41 @@ def _normalize_url(url: str) -> str:
     u = (url or "").strip().lower()
     u = re.sub(r"[?#].*$", "", u).rstrip("/")
     return u
+
+
+def _needs_workspace(query: str) -> bool:
+    """是否為工作區檔案操作（寫檔／建資料夾）｜新手：動手做檔案，就別浪費時間翻筆記。」"""
+    text = _strip_edge(query).lower()
+    if not text:
+        return False
+    return any(kw in text for kw in _WORKSPACE_KEYWORDS)
+
+
+def _needs_music(query: str) -> bool:
+    """是否為音樂播放請求｜新手：聽歌不需翻筆記，直接開 YouTube。
+
+    P22：除關鍵字硬比對外，「播放動詞＋音樂名詞」組合也算，涵蓋口語說法。
+    """
+    text = _strip_edge(query).lower()
+    if not text:
+        return False
+    if any(kw in text for kw in _MUSIC_KEYWORDS):
+        return True
+    return any(v in text for v in _MUSIC_PLAY_VERBS) and any(n in text for n in _MUSIC_NOUNS)
+
+
+def _detect_intent(query: str) -> str | None:
+    """工具意圖分流：music／workspace／None（一般問答，工具全給）。
+
+    偵測不到回 None，上層走完整工具清單，寧可多送 token 也不讓功能失效。
+    P21：兩者都命中（如含 YouTube 又要寫檔）回 None 給完整清單，避免誤刪工具。
+    """
+    want_music = _needs_music(query)
+    want_workspace = _needs_workspace(query)
+    if want_music and want_workspace:
+        return None
+    if want_music:
+        return "music"
+    if want_workspace:
+        return "workspace"
+    return None
