@@ -73,9 +73,10 @@ class TestWorkspaceSandbox:
         assert not (tmp_path.parent / "evil.txt").exists()
 
     def test_absolute_blocked(self, tmp_path: Path) -> None:
-        """絕對路徑擋下。」"""
+        """絕對路徑擋下（用跨平台都算絕對的路徑，Windows C:/ 在 Linux 不算絕對）。」"""
+        abs_path = str(tmp_path / "hack")
         with mock.patch.object(chat_core, "_workspace_root", return_value=tmp_path):
-            out = chat_core._run_tool("workspace_make_dir", {"path": "C:/Windows/hack"}, "test")
+            out = chat_core._run_tool("workspace_make_dir", {"path": abs_path}, "test")
         assert "相對路徑" in out
 
     def test_write_and_mkdir_roundtrip(self, tmp_path: Path) -> None:
