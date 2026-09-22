@@ -1,9 +1,6 @@
 """P11+P12 回歸測試：雙預算／雙指標／串流重試，不碰真網路。"""
 
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unittest import mock
 

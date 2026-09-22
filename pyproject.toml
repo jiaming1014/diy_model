@@ -7,17 +7,18 @@ requires-python = ">=3.12"
 dependencies = [
   "ollama==0.6.2",
   "ddgs==9.16.0",
-  "qdrant-client==1.19.0",
+  "qdrant-client==1.19.1",
+  "tzdata",  # Windows 無系統時區庫，zoneinfo(Asia/Taipei) 必需；與 requirements.txt 同步
 ]
 
 [project.optional-dependencies]
 pdf = ["pypdf"]
 docx = ["python-docx==1.2.0"]
 ocr = ["Pillow==12.3.0", "pytesseract"]
-rerank = ["sentence-transformers==6.0.1"]
+rerank = ["sentence-transformers==6.1.0"]
 tokens = ["tiktoken"]
 cli = ["prompt_toolkit"]
-dev = ["pytest==9.1.1", "ruff", "pyright"]
+dev = ["pytest==9.1.1", "ruff==0.16.8", "pyright==1.1.414"]  # 版本單一來源在 requirements-dev.txt（TOS 不支援引用檔案，改版請兩處同步）
 
 [tool.ruff]
 target-version = "py312"

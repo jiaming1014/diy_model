@@ -3,10 +3,7 @@
 全部不碰真網路：ollama.Client 僅建構（不呼叫 API），其餘外部依賴以 mock 隔離。
 """
 
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unittest import mock
 

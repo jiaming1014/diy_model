@@ -1,9 +1,6 @@
 """P3+P4 回歸測試：預算／去重／截斷／清洗／TTL／refresh／MRR，不碰真網路。"""
 
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unittest import mock
 
@@ -29,6 +26,11 @@ class TestUserTruncate:
         assert len(out) <= chat_core.USER_MAX_CHARS + 20
         assert out.endswith("…（過長已截斷）")
 
+    def test_surrogates_stripped(self) -> None:
+        """孤立代理字清掉，正常字不受影響，後續 json／模型序列化不炸。」"""
+        assert _truncate_user_msg("a\udcbftest") == "atest"
+        assert _truncate_user_msg("你好") == "你好"
+
 
 class TestQueryClean:
     def test_filler_removed(self) -> None:
@@ -45,8 +47,10 @@ class TestQueryClean:
 
 class TestUrlNormalize:
     def test_same_url_variants(self) -> None:
-        """大小寫＋追蹤參數＋尾斜線視為同一網址（去重用）。」"""
-        assert _normalize_url("https://Example.com/a/?x=1") == _normalize_url("https://example.com/a")
+        """大小寫＋追蹤參數＋尾斜線視為同一網址（去重用）；非追蹤 query 視為不同頁。」"""
+        assert _normalize_url("https://Example.com/a/?utm_source=google") == _normalize_url("https://example.com/a")
+        assert _normalize_url("https://example.com/a?fbclid=xyz") == _normalize_url("https://example.com/a")
+        assert _normalize_url("https://example.com/a?id=123") != _normalize_url("https://example.com/a")
 
 
 class TestSearchDedup:

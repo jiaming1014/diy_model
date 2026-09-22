@@ -44,7 +44,8 @@ from config import RERANK_THRESHOLD as RERANK_THRESHOLD
 logger = logging.getLogger(__name__)
 
 # P17：逐筆備援上限＋並行，避免整批解析失敗時 N 次串行拖延。
-_LLM_PERDOC_MAX: int = 8  # 超過此數的文件，超出部分直接記 0 分，不再逐筆打模型
+# 上限 4：預設取 3 完全夠用；本機小模型逐筆極慢，8 連打實測 300 秒做不完
+_LLM_PERDOC_MAX: int = 4  # 超過此數的文件，超出部分直接記 0 分，不再逐筆打模型
 _LLM_PERDOC_WORKERS: int = 4  # 逐筆備援並行數
 
 
@@ -52,7 +53,7 @@ def _sync_config() -> None:
     """P10 即時同步：重讀 config 真相，模型名變了清掉舊 CrossEncoder。
 
     P14：ollama client 只在逾時真的變了才丟棄（舊版每次呼叫都清成 None，
-    等於每次重排都重建），換掉前先關舊連線。
+    等於每次重排都重建）；P17 起改拿共用快取，快取內的舊實例不關閉。
     """
     global _ollama_timeout, RERANK_BACKEND, RERANK_BATCH, RERANK_ENABLE
     global RERANK_DOC_MAX_CHARS, RERANK_QUERY_MAX_CHARS
@@ -155,7 +156,7 @@ def _load_cross_model():
 
 
 def _list_ollama_names() -> list[str] | None:
-    """列出 Ollama 模型名，失敗回 None。」"""
+    """列出 Ollama 模型名，失敗回 None（解析走共用 helper，認回傳物件；函式名保留供測試 mock）。"""
     try:
         client = _get_ollama()
         if client is None:
@@ -164,23 +165,13 @@ def _list_ollama_names() -> list[str] | None:
     except Exception as e:
         logger.warning("LLM 可用性探測失敗：%s", e)
         return None
-    names: list[str] = []
-    if isinstance(models, dict):
-        items = models.get("models", []) or []
-        for m in items:
-            if isinstance(m, dict):
-                n = m.get("name") or m.get("model")
-                if n:
-                    names.append(str(n))
-    elif isinstance(models, list):
-        for m in models:
-            if isinstance(m, str):
-                names.append(m)
-            elif isinstance(m, dict):
-                n = m.get("name") or m.get("model")
-                if n:
-                    names.append(str(n))
-    return names
+    try:
+        from ollama_shared import ollama_model_names as _parse_names
+
+        return _parse_names(models)
+    except Exception as e:
+        logger.warning("模型名單解析失敗：%s", e)
+        return None
 
 
 def probe_availability(timeout_s: float = 5.0) -> dict[str, bool]:
@@ -232,7 +223,7 @@ def _rerank_cross(query: str, docs: list[dict[str, str]], top_k: int) -> list[di
             # 註：按字元截斷是省記憶體的近似，中文大致 1 字 ~ 1-2 token
             pairs = [[query, str(d.get("text", "") or "")[:RERANK_DOC_MAX_CHARS]] for d in docs[i:i + batch]]
             try:
-                part = model.predict(pairs)
+                part = model.predict(pairs, show_progress_bar=False)  # 進度條關掉，CLI 不洗版（失敗照樣走備援）
             except Exception as e:
                 logger.warning("CrossEncoder 批次 %d 失敗（%s），嘗試備援", i // batch, e)
                 return None
@@ -245,7 +236,7 @@ def _rerank_cross(query: str, docs: list[dict[str, str]], top_k: int) -> list[di
             item = dict(d)
             item["score"] = float(s)  # pyright: ignore[reportArgumentType] - score 欄位實為數字，型別沿用舊宣告
             ranked.append(item)
-        ranked.sort(key=lambda x: x["score"], reverse=True)
+        ranked.sort(key=lambda x: x["score"], reverse=True)  # 高分排前，取前 top_k 條
         return ranked[:top_k]
     except Exception as e:
         logger.warning("CrossEncoder 重排失敗（%s），嘗試備援", e)
@@ -280,6 +271,7 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
         return None
     try:
         start, end = text.find("["), text.rfind("]")
+        # 取首尾括號包住那段解析，模型前後的客套話直接忽略
         data = json.loads(text[start:end + 1] if start != -1 and end != -1 else text)
         if isinstance(data, list):
             scores = [_clamp_score(x) for x in data]
@@ -288,7 +280,8 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
     except Exception:
         pass
     nums = [_clamp_score(x) for x in re.findall(r"\d+(?:\.\d+)?", text)]
-    if len(nums) == len(docs) and "[" in text and "]" in text:
+    if len(nums) == len(docs):
+        # 個數吻合即收：裸分數串（無括號）也認，省掉逐筆備援的 N 次呼叫；巧合撞數機率極低
         return nums[:len(docs)]
     # P6 強韌：整批解析失敗改逐筆打分，單筆失敗記 0 分不丟整批
     # P17：加並行＋上限，N 筆串行是最大延遲炸彈；超過上限的直接記 0 分
@@ -314,6 +307,7 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
             return idx, 0.0
 
     if len(target) == 1:
+        # 只有一份就別開執行緒池，直接打省開銷
         idx, score = _score_one((0, target[0]))
         per_doc[idx] = score
     else:
@@ -327,16 +321,21 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
 
 
 def _rerank_llm(query: str, docs: list[dict[str, str]], top_k: int) -> list[dict[str, str]] | None:
-    """LLM 備援排序，失敗回 None。」"""
-    scores = _llm_scores(query, docs)
+    """LLM 備援排序，失敗回 None。
+
+    首批只取向量前 N 份（N＝max(top_k, 逐筆上限)），避免 15 份全塞小模型又擠又易解析失敗。
+    """
+    cap = max(max(1, int(top_k)), _LLM_PERDOC_MAX)
+    scoring = docs[:cap]
+    scores = _llm_scores(query, scoring)
     if scores is None:
         return None
     ranked = []
-    for d, s in zip(docs, scores):
+    for d, s in zip(scoring, scores):
         item = dict(d)
         item["score"] = float(s)  # pyright: ignore[reportArgumentType] - 同上
         ranked.append(item)
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    ranked.sort(key=lambda x: x["score"], reverse=True)  # 高分排前，取前 top_k 條
     return ranked[:top_k]
 
 
@@ -349,12 +348,13 @@ def rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[
         return []
     if not RERANK_ENABLE or RERANK_BACKEND == "none":
         return docs[:top_k]
-    q = query.strip()[:RERANK_DOC_MAX_CHARS]
+    q = query.strip()[:RERANK_QUERY_MAX_CHARS]
     if not q:
         return docs[:top_k]
     result: list[dict[str, str]] | None = None
     if RERANK_BACKEND in ("auto", "crossencoder"):
         result = _rerank_cross(q, docs, top_k)
+        # 指定單一後端時不換備援：失敗就原順序，避免測 A 後端卻混入 B 的分數
         if result is not None or RERANK_BACKEND == "crossencoder":
             out = result if result is not None else docs[:top_k]
             return _apply_threshold(out)

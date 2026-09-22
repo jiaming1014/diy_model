@@ -1,11 +1,8 @@
 """P18 回歸測試：refresh 扇出節流／失敗短快取／快取統計，不碰真網路。"""
 
 import logging
-import sys
 import time
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unittest import mock
 

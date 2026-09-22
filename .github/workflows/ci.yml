@@ -5,16 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # H1：專案有大量 Windows 專屬邏輯（cp950／big5 解碼、OneDrive 桌面、磁碟機路徑阻擋、
+    # surrogate 清理、stdout 重設），且磁碟機阻擋測試在 Linux 會 skip；Ubuntu 單腿看不到這些。
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
       - name: Install deps
-        run: pip install -r requirements.txt pytest==9.1.1 ruff pyright
+        # H3：工具版本單一來源在 requirements-dev.txt（勿在此硬編版本）
+        run: pip install -r requirements.txt -r requirements-dev.txt
       - name: Lint
         run: python -m ruff check .
       - name: Types

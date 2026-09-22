@@ -4,8 +4,6 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from unittest import mock
 
 import chat_core
@@ -145,11 +143,20 @@ class TestIngestPartialOk:
         (tmp_path / "partial.md").write_text("A" * 900 + "\n\n" + "B" * 900, encoding="utf-8")
 
         def fake_flush(client, chunks, metas, ensured):
-            """假寫入：partial.md 只成功一部分，其餘全成功。」"""
-            src = metas[0].get("source", "")
-            if src == "partial.md":
-                return (1, 0)  # 只成功一部分
-            return (len(chunks), 0)
+            """假寫入：partial.md 只成功一部分，其餘全成功（相容跨檔混批）。"""
+            done: dict[str, int] = {}
+            written = 0
+            for m in metas:
+                src = m.get("source", "")
+                if src == "partial.md":
+                    # 該檔只算 1 塊完成，其餘視為嵌入失敗不計完成
+                    if done.get(src, 0) < 1:
+                        done[src] = done.get(src, 0) + 1
+                        written += 1
+                else:
+                    done[src] = done.get(src, 0) + 1
+                    written += 1
+            return (written, 0, done)
 
         with mock.patch.object(rq, "_client"):
             with mock.patch.object(rq, "_flush_batch", side_effect=fake_flush):
@@ -159,6 +166,27 @@ class TestIngestPartialOk:
         cache = json.loads((tmp_path / rq._INGEST_CACHE_NAME).read_text(encoding="utf-8"))
         assert cache["full.md"]["ok"] is True
         assert cache["partial.md"]["ok"] is False
+
+class TestExistingIdNormalization:
+    def test_dashed_ids_match(self) -> None:
+        """Qdrant 回傳加 dash 的 UUID 也比對得上，未變塊零寫入零嵌入（曾全量重嵌）。"""
+        import types
+
+        chunks = ["第一塊", "第二塊"]
+        metas = [{"source": "a.md", "text": t} for t in chunks]
+        pids = [rq._stable_id(m["source"], t) for m, t in zip(metas, chunks)]
+        assert "-" not in pids[0]  # 自家是無 dash md5，庫裡是加 dash 形
+
+        def _dashed(h: str) -> str:
+            """32 字 hex 補成 UUID 標準形，模擬 Qdrant 回傳。」"""
+            return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+        recs = [types.SimpleNamespace(id=_dashed(pid), payload={"source": m["source"], "text": m["text"]}) for pid, m in zip(pids, metas)]
+        fake_client = types.SimpleNamespace(retrieve=lambda **kw: recs)
+        ensured: dict[str, bool] = {}
+        written, skipped, done = rq._flush_batch(fake_client, chunks, metas, ensured)
+        assert (written, skipped) == (0, 2)
+        assert done == {"a.md": 2}
 
 
 # ------------------------------------------------------------
@@ -203,7 +231,10 @@ class TestHealthCheck:
         with mock.patch("reranker.probe_availability", return_value={"crossencoder": True, "llm": True}):
             with mock.patch.object(rq, "_client") as m_client:
                 m_client.return_value.get_collections.return_value = coll
-                rc = chat_cli._run_health_check("m")
+                # 嵌入／聊天探測不碰真 Ollama，否則無服務的 CI 必紅
+                with mock.patch.object(rq, "probe_embed", return_value=True):
+                    with mock.patch("ollama_shared.probe_model", return_value=True):
+                        rc = chat_cli._run_health_check("m")
         assert rc == 0
 
     def test_failures_return_nonzero(self) -> None:
@@ -212,5 +243,7 @@ class TestHealthCheck:
 
         with mock.patch("reranker.probe_availability", return_value={"crossencoder": False, "llm": False}):
             with mock.patch.object(rq, "_client", side_effect=RuntimeError("boom")):
-                rc = chat_cli._run_health_check("m")
+                with mock.patch.object(rq, "probe_embed", return_value=False):
+                    with mock.patch("ollama_shared.probe_model", return_value=False):
+                        rc = chat_cli._run_health_check("m")
         assert rc == 1

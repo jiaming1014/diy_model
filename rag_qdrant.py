@@ -25,12 +25,20 @@ import hashlib
 import json
 import logging
 import re
+from collections import deque
 from pathlib import Path
 import threading
 
 import ollama
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, PointStruct, VectorParams
+
+# 重型依賴延遲載入：qdrant_client import 約 1.6 秒，改在首次使用處函式內載入，
+# CLI 啟動／純聊天不付這筆；TYPE_CHECKING 區供靜態檢查解析型別（執行期不跑）。
+# 注意：模組 __getattr__（PEP 562）不管模組內全域查找，此處不用它。
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http.models import Distance, PointStruct, VectorParams  # noqa: F401 - 執行期由函式內 import 提供
 
 # 設定唯一真相在 config.py，這裡保留 RAGConfig 介面（欄位名不變）
 import config as _config
@@ -136,6 +144,21 @@ def get_config() -> RAGConfig:
     return _CONFIG
 
 
+def probe_embed(timeout_s: float = 5.0) -> bool:
+    """探測嵌入模型是否在 Ollama 就緒，逾時當不可用｜新手：RAG 吃飯的傢伙，--health 先驗。
+
+    名單比對轉調共用 probe_model（認 dict／list／回傳物件），行為一致。
+    """
+    _sync_config()
+    try:
+        from ollama_shared import probe_model as _probe_model
+
+        return bool(_probe_model(_CONFIG.embed_model, _CONFIG.timeout, timeout_s))
+    except Exception as e:
+        logger.warning("嵌入模型探測失敗（%s），視為不可用", e)
+        return False
+
+
 # --- 相容舊匯入：快照值，內部一律用 _CONFIG，外部改此值不影響運行 ---
 QDRANT_URL: str = _CONFIG.url
 QDRANT_COLLECTION: str = _CONFIG.collection
@@ -164,7 +187,7 @@ SUPPORTED_SUFFIXES: set[str] = {
 IMAGE_SUFFIXES: set[str] = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 _client_lock = threading.Lock()
-_cached_client: QdrantClient | None = None
+_cached_client: "QdrantClient | None" = None  # 引號避免 import 期求值（本體只在函式內與 TYPE_CHECKING 匯入）
 _cached_key: tuple[str, str] | None = None  # (url, api_key)，P16：任一變了就換連線
 
 # P14：問題向量快取改用共用 TTLCache，同一問句重複檢索不再重新嵌入
@@ -174,20 +197,35 @@ _QUERY_VEC_CACHE: TTLCache[list[float]] = TTLCache(
 )
 
 
+def _normalize_query_key(query: str) -> str:
+    """查詢向量快取鍵正規化：壓空白＋去頭尾，大小寫不同視為同鍵，省重複嵌入。」"""
+    text = query if isinstance(query, str) else ("" if query is None else str(query))
+    norm = re.sub(r"\s+", " ", text.strip()).strip()
+    return norm.lower() or norm
+
+
 def _embed_query_vec(query: str) -> list[float] | None:
-    """問題轉向量，走共用 TTL 快取：命中回複本，過期重算。」"""
-    hit = _QUERY_VEC_CACHE.get(query)
+    """問題轉向量，走共用 TTL 快取：命中回複本，過期重算。
+
+    快取鍵正規化共用（省重複嵌入），嵌入吃原文保留大小寫語義；
+    存取皆用複本，避免呼叫端改到快取本體。
+    """
+    key = _normalize_query_key(query)
+    if not key:
+        return None
+    hit = _QUERY_VEC_CACHE.get(key)
     if hit is not None:
         return list(hit)
-    vecs = _embed_texts([query])
+    exact = query.strip() if isinstance(query, str) else key
+    vecs = _embed_texts([exact or key])
     if not vecs:
         return None
     vec = vecs[0]
-    _QUERY_VEC_CACHE.put(query, vec)
-    return vec
+    _QUERY_VEC_CACHE.put(key, list(vec))
+    return list(vec)
 
 
-def _client() -> QdrantClient:
+def _client() -> "QdrantClient":
     """Qdrant 單例連線｜新手：電話打一次就留著，別每次都重撥。」"""
     global _cached_client, _cached_key
     url = _CONFIG.url  # 優化：唯一真相走 _CONFIG，避免與相容快照漂移
@@ -200,6 +238,7 @@ def _client() -> QdrantClient:
                 _cached_client.close()
             except Exception:
                 pass
+        from qdrant_client import QdrantClient  # 函式內載入：平時不付 1.6 秒 import，sys.modules 快取后续呼叫
         if key[1]:
             _cached_client = QdrantClient(url=key[0], api_key=key[1])
         else:
@@ -231,7 +270,10 @@ def _tok_len(text: str) -> int:
             _tiktoken_enc = tiktoken.get_encoding("cl100k_base")
         except Exception:
             _tiktoken_warned = True  # 只警告一次，避免每塊洗版
-            logger.info("缺 tiktoken，切塊改用字元估算（pip install tiktoken 可啟用 token 預算）")
+            if _CONFIG.chunk_max_tokens > 0:
+                logger.warning("缺 tiktoken 卻設了 CHUNK_MAX_TOKENS=%s，token 預算已退化成字數估算（pip install tiktoken 恢復精算）", _CONFIG.chunk_max_tokens)
+            else:
+                logger.info("缺 tiktoken，切塊改用字元估算（pip install tiktoken 可啟用 token 預算）")
             return len(text)
     if _tiktoken_enc is None:
         return len(text)
@@ -257,6 +299,7 @@ def _over_budget(buf: str, chunk_chars: int, chunk_tokens: int) -> bool:
     return _tok_len(buf) > chunk_tokens
 
 
+# 句尾標點後斷句（lookbehind 只斷不斷字）；沒標點的長串後面走字元硬切
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;…])\s*")
 
 
@@ -307,7 +350,7 @@ def _chunk_text(text: str, chunk_chars: int | None = None, overlap: int | None =
                     break
             if not sent:
                 continue
-            probe = (buf + " " + sent).strip() if buf else sent
+            probe = (buf + " " + sent).strip() if buf else sent  # 先試塞進現有塊，塞不下才落袋開新塊
             if buf and _over_budget(probe, cc, ct):
                 chunks.append(buf.strip())
                 buf = _overlap_tail(buf, ov)
@@ -378,24 +421,36 @@ def _embed_with_order(texts: list[str]) -> dict[int, list[float]]:
     if not texts:
         return out
     # 同文分組：uniq_texts 只嵌一次，groups 記回填位置
+    # 雜湊鍵：全文當 key 會讓大批量匯入時同份文字存兩次，改用 sha256 省記憶體
     uniq: list[str] = []
     index_of: dict[str, int] = {}
     groups: dict[int, list[int]] = {}
     for i, t in enumerate(texts):
-        u = index_of.get(t)
-        if u is None:
-            u = len(uniq)
-            index_of[t] = u
-            uniq.append(t)
-            groups[u] = [i]
-        else:
+        h = hashlib.sha256(t.encode("utf-8", errors="ignore")).hexdigest()
+        u = index_of.get(h)
+        if u is not None and uniq[u] == t:
             groups[u].append(i)
+            continue
+        if u is not None:
+            # 極低機率雜湊碰撞：退回全文比對
+            found: int | None = None
+            for cand, ut in enumerate(uniq):
+                if ut == t:
+                    found = cand
+                    break
+            if found is not None:
+                groups[found].append(i)
+                continue
+        u = len(uniq)
+        index_of[h] = u
+        uniq.append(t)
+        groups[u] = [i]
 
     def _rec(indexed: list[tuple[int, str]]) -> None:
         """遞迴切半：整批失敗拆兩半重試，單塊失敗丟棄不影響整批。」"""
         if not indexed:
             return
-        batch = [t for _, t in indexed]
+        batch = [t for _, t in indexed]  # 下標稍後由 zip 回填，這裡只取文字送嵌
         ok = _embed_single_batch(batch)
         if ok is not None and len(ok) == len(indexed):
             for (u_idx, _), vec in zip(indexed, ok):
@@ -425,12 +480,14 @@ def ensure_collection(dim: int) -> None:
         return
     except Exception as e:
         if "維度不符" in str(e):
-            raise
+            raise  # 自己拋的維度錯誤直接上浮，不可誤判成「不存在」去重建
         msg = str(e).lower()
         if any(k in msg for k in ("connect", "refused", "connection", "timeout", "unreachable")):
             raise RuntimeError(f"連不上 Qdrant（{_CONFIG.url}）：{e}") from e
         if not any(k in msg for k in ("404", "not found", "not exist", "doesn't exist", "does not exist")):
             logger.warning("查詢收藏集時發生未知錯誤（%s），嘗試建立", e)
+    from qdrant_client.http.models import Distance, VectorParams  # 函式內載入，同上
+
     client.create_collection(
         collection_name=_CONFIG.collection,
         vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
@@ -445,9 +502,13 @@ def _read_pdf(fp: Path) -> str:
     except ImportError as e:
         raise RuntimeError(f"{fp.name} 是 PDF，但缺 pypdf，請先 pip install pypdf") from e
     max_pages = max(1, int(_CONFIG.pdf_max_pages or 200))
-    reader = PdfReader(str(fp))
+    try:
+        reader = PdfReader(str(fp))
+        total = len(reader.pages)
+    except Exception as e:  # 空檔／損毀／加密到開不了：回佔位標 ok，修好檔 mtime 一變照樣重抓
+        logger.warning("%s 開啟失敗（%s），僅檔名可檢索", fp.name, e)
+        return f"[PDF檔：{fp.name}（無法開啟，僅檔名可檢索）]"
     parts: list[str] = []
-    total = len(reader.pages)
     for i, page in enumerate(reader.pages[:max_pages], start=1):
         try:
             t = page.extract_text() or ""
@@ -458,7 +519,15 @@ def _read_pdf(fp: Path) -> str:
     if total > max_pages:
         logger.warning("%s 共 %d 頁，已截斷為前 %d 頁", fp.name, total, max_pages)
         parts.append(f"（以下 {total - max_pages} 頁已截斷）")
-    return "\n\n".join(parts)
+    text = "\n\n".join(parts)
+    if not text.strip() and total > 0:
+        # 掃描／加密 PDF 抽不到字：回佔位而非空字串，避免匯入標 ok 永久跳過（與圖片策略一致）
+        return f"[PDF檔：{fp.name}（共 {total} 頁，未能抽出文字，可能是掃描檔或加密，僅檔名可檢索）]"
+    max_chars = max(1000, int(_CONFIG.text_max_chars or 200000))
+    if len(text) > max_chars:
+        logger.warning("%s 合併文字超過 %d 字上限，已截斷", fp.name, max_chars)
+        return text[:max_chars] + f"\n\n（已截斷，僅取前 {max_chars} 字）"
+    return text
 
 
 def _read_docx(fp: Path) -> str:
@@ -468,47 +537,96 @@ def _read_docx(fp: Path) -> str:
     except ImportError as e:
         raise RuntimeError(f"{fp.name} 是 DOCX，但缺 python-docx，請先 pip install python-docx") from e
     max_paras = max(1, int(_CONFIG.docx_max_paras or 5000))
-    doc = docx.Document(str(fp))
+    try:
+        doc = docx.Document(str(fp))
+    except Exception as e:  # 損毀檔打不開：回佔位標 ok，修好檔 mtime 一變照樣重抓
+        logger.warning("%s 開啟失敗（%s），僅檔名可檢索", fp.name, e)
+        return f"[DOCX檔：{fp.name}（無法開啟，僅檔名可檢索）]"
     parts: list[str] = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
         for row in table.rows:
-            line = " | ".join(c.text.strip() for c in row.cells).strip(" |")
-            if line.strip(" |"):
+            line = " | ".join(c.text.strip() for c in row.cells).strip()
+            if line.strip(" |"):  # 去掉分隔符後還有字才收，全空格格不佔段落預算
                 parts.append(line)
     if len(parts) > max_paras:
         logger.warning("%s 共 %d 段，已截斷為前 %d 段", fp.name, len(parts), max_paras)
         parts = parts[:max_paras] + [f"（以下 {len(parts) - max_paras} 段已截斷）"]
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    if not text.strip() and (doc.paragraphs or doc.tables):
+        return f"[DOCX檔：{fp.name}（未能抽出文字，僅檔名可檢索）]"
+    max_chars = max(1000, int(_CONFIG.text_max_chars or 200000))
+    if len(text) > max_chars:
+        logger.warning("%s 合併文字超過 %d 字上限，已截斷", fp.name, max_chars)
+        return text[:max_chars] + f"\n\n（已截斷，僅取前 {max_chars} 字）"
+    return text
 
 
 def _read_csv(fp: Path) -> str:
     """讀 .csv：標頭＋每列轉文字，超列數截斷，只用標準庫。
 
     P15：邊讀邊數，讀到上限＋1 列即停，大 CSV 不再整檔進記憶體。
+    編碼相容：依序試 utf-8-sig → cp950 → big5（台灣 Excel 常見），
+    都失敗才退回 utf-8 忽略錯誤，避免亂碼或整檔跳過。
     """
     max_rows = max(1, int(_CONFIG.csv_max_rows or 5000))
-    with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+
+    def _parse_with_encoding(enc: str) -> tuple[list[list[str]], bool]:
+        """用指定編碼解析，嚴格解碼，遇到解碼錯誤直接拋出換下一個編碼。」"""
+        with fp.open("r", encoding=enc, errors="strict", newline="") as f:
+            try:
+                sample = f.read(4096)
+                f.seek(0)
+                dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
+            except Exception:
+                f.seek(0)
+                dialect = csv.excel
+            reader = csv.reader(f, dialect)
+            rows: list[list[str]] = []
+            truncated = False
+            for r in reader:
+                if any(c.strip() for c in r):
+                    rows.append([c.strip() for c in r])
+                    if len(rows) > max_rows + 1:  # 表頭＋上限＋至少一列超額 → 確定截斷
+                        truncated = True
+                        break
+            return rows, truncated
+
+    rows: list[list[str]] = []
+    truncated = False
+    last_err: Exception | None = None
+    for enc in ("utf-8-sig", "cp950", "big5"):
         try:
-            sample = f.read(4096)
-            f.seek(0)
-            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
-        except Exception:
-            f.seek(0)
-            dialect = csv.excel
-        reader = csv.reader(f, dialect)
-        rows: list[list[str]] = []
-        truncated = False
-        for r in reader:
-            if any(c.strip() for c in r):
-                rows.append([c.strip() for c in r])
-                if len(rows) > max_rows + 1:  # 表頭＋上限＋至少一列超額 → 確定截斷
-                    truncated = True
-                    break
+            rows, truncated = _parse_with_encoding(enc)
+            if enc != "utf-8-sig":
+                logger.info("%s 以 %s 解碼", fp.name, enc)
+            break
+        except (UnicodeDecodeError, UnicodeError, ValueError) as e:
+            last_err = e
+            continue
+    else:
+        logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
+        with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+            try:
+                sample = f.read(4096)
+                f.seek(0)
+                dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType]
+            except Exception:
+                f.seek(0)
+                dialect = csv.excel
+            reader = csv.reader(f, dialect)
+            rows = []
+            truncated = False
+            for r in reader:
+                if any(c.strip() for c in r):
+                    rows.append([c.strip() for c in r])
+                    if len(rows) > max_rows + 1:
+                        truncated = True
+                        break
     if not rows:
         return ""
     header = rows[0]
     lines = ["表頭：" + " | ".join(header)]
-    for r in rows[1:1 + max_rows]:
+    for r in rows[1:1 + max_rows]:  # 從第 1 列開始（跳過表頭），只取上限列數
         if len(r) == len(header):
             lines.append("；".join(f"{h}：{v}" for h, v in zip(header, r) if v))
         else:
@@ -531,14 +649,31 @@ def _read_image(fp: Path) -> str:
         from PIL import Image
         import pytesseract
         with Image.open(fp) as img:
-            ocr = pytesseract.image_to_string(img, lang="chi_tra+eng").strip()
+            try:
+                ocr = pytesseract.image_to_string(img, lang="chi_tra+eng").strip()
+            except Exception:
+                # 缺中文語言包時退回預設英文，英文截圖仍救得回
+                ocr = pytesseract.image_to_string(img).strip()
         if ocr:
             return f"[圖片 {fp.name} 的 OCR 文字]\n{ocr}"
     except Exception:
         pass
     try:
-        with fp.open("rb") as f:
-            img_bytes = f.read()
+        try:
+            # 視覺模型前先縮圖：最長邊 1024，省 token 又更快；缺 PIL 則原圖直送降級
+            from io import BytesIO
+
+            from PIL import Image as _PilImage
+
+            with _PilImage.open(fp) as _img:
+                _img = _img.convert("RGB")
+                _img.thumbnail((1024, 1024))
+                _buf = BytesIO()
+                _img.save(_buf, format="JPEG", quality=85)
+                img_bytes = _buf.getvalue()
+        except Exception:
+            with fp.open("rb") as f:
+                img_bytes = f.read()
         msg = _ollama.chat(
             model=_CONFIG.vision_model,
             messages=[{"role": "user", "content": f"請用繁體中文描述這張圖片的內容，包含圖中文字：{fp.name}", "images": [img_bytes]}],
@@ -565,8 +700,20 @@ def _read_file_text(fp: Path) -> str:
     if suffix in {".txt", ".md"}:
         max_chars = max(1000, int(_CONFIG.text_max_chars or 200000))
         # P15：只讀到上限＋1 字就停，超大純文字檔不再整檔載入記憶體
-        with fp.open("r", encoding="utf-8", errors="ignore") as f:
-            text = f.read(max_chars + 1)
+        # 編碼相容：utf-8 嚴格先試，台灣記事本常見 cp950／big5 接著試，都失敗才退回忽略錯誤
+        text = ""
+        for enc in ("utf-8", "utf-8-sig", "cp950", "big5"):
+            try:
+                with fp.open("r", encoding=enc, errors="strict") as f:
+                    text = f.read(max_chars + 1)
+                if enc not in ("utf-8", "utf-8-sig"):
+                    logger.info("%s 以 %s 解碼", fp.name, enc)
+                break
+            except (UnicodeDecodeError, UnicodeError, ValueError):
+                continue
+        else:
+            with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                text = f.read(max_chars + 1)
         if len(text) > max_chars:
             logger.warning("%s 超過 %d 字上限，已截斷", fp.name, max_chars)
             return text[:max_chars] + f"\n\n（已截斷，僅取前 {max_chars} 字）"
@@ -582,19 +729,20 @@ def _read_file_text(fp: Path) -> str:
     raise ValueError(f"不支援的類型：{suffix}")
 
 
-def _existing_text_map(client: QdrantClient, pids: list[str]) -> dict[str, str]:
+def _existing_text_map(client: "QdrantClient", pids: list[str]) -> dict[str, str]:
     """查已存在的點 ID→內文，用於增量跳過。」"""
     if not pids:
         return {}
     try:
         out: dict[str, str] = {}
-        for i in range(0, len(pids), 128):
+        for i in range(0, len(pids), 128):  # 128 個一批查，避免一次塞太多 ID 打爆請求
             batch = pids[i:i + 128]
             records = client.retrieve(collection_name=_CONFIG.collection, ids=batch, with_payload=True)
             for rec in records:
                 payload = getattr(rec, "payload", None) or {}
                 text = str(payload.get("text", "") or "")
-                out[str(getattr(rec, "id", ""))] = text
+                # Qdrant 回傳 UUID 標準形（含 dash），自家 pid 是無 dash md5，去 dash 才比得上
+                out[str(getattr(rec, "id", "")).replace("-", "")] = text
         return out
     except Exception as e:
         # 收藏集不存在時 retrieve 會 404，直接當全量寫入，不警告洗版
@@ -604,33 +752,56 @@ def _existing_text_map(client: QdrantClient, pids: list[str]) -> dict[str, str]:
         return {}
 
 
-def _flush_batch(client: QdrantClient, batch_chunks: list[str], batch_metas: list[dict[str, str]], ensured: dict[str, bool]) -> tuple[int, int]:
-    """嵌入並寫入一批，回 (寫入數, 跳過數)。"""
+def _flush_batch(
+    client: "QdrantClient",
+    batch_chunks: list[str],
+    batch_metas: list[dict[str, str]],
+    ensured: dict[str, bool],
+) -> tuple[int, int, dict[str, int]]:
+    """嵌入並寫入一批，回 (寫入數, 跳過數, 各來源完成數)。
+
+    完成數只計寫入＋未變跳過，嵌入失敗的不計，呼叫端以此判定整檔是否成功。
+    同批可混多檔（跨檔批量），各來源歸因精確。
+    """
     if not batch_chunks:
-        return 0, 0
+        return 0, 0, {}
     pids = [_stable_id(m["source"], t) for m, t in zip(batch_metas, batch_chunks)]
     existing = _existing_text_map(client, pids)
-    todo_idx = [i for i, (pid, txt) in enumerate(zip(pids, batch_chunks)) if existing.get(pid, None) != txt]
-    skipped = len(pids) - len(todo_idx)
+    todo_idx = [i for i, (pid, txt) in enumerate(zip(pids, batch_chunks)) if existing.get(pid, None) != txt]  # 查無或內文變了才需重嵌，其餘跳過
+    skipped_idx = {i for i in range(len(pids))} - set(todo_idx)
+    skipped = len(skipped_idx)
+    done_by_source: dict[str, int] = {}
+    for i in skipped_idx:
+        src = batch_metas[i].get("source", "")
+        done_by_source[src] = done_by_source.get(src, 0) + 1
     if not todo_idx:
-        return 0, skipped
+        return 0, skipped, done_by_source
     todo_texts = [batch_chunks[i] for i in todo_idx]
     vec_map = _embed_with_order(todo_texts)
     if not vec_map:
         logger.warning("跳過一批（嵌入全失敗，%d 塊）", len(todo_texts))
-        return 0, skipped
+        return 0, skipped, done_by_source
     if not ensured.get("done"):
+        # 首批成功才建表：用實際向量維度建，維度不符早拋錯不空轉
         sample_vec = next(iter(vec_map.values()))
         ensure_collection(len(sample_vec))
         ensured["done"] = True
+    from qdrant_client.http.models import PointStruct  # 函式內載入，同上
+
     points: list[PointStruct] = []
+    written_idx: list[int] = []
     for order, orig_i in enumerate(todo_idx):
         if order not in vec_map:
             continue
         points.append(PointStruct(id=pids[orig_i], vector=vec_map[order], payload=batch_metas[orig_i]))
-    for j in range(0, len(points), _CONFIG.upsert_batch):
-        client.upsert(collection_name=_CONFIG.collection, points=points[j:j + _CONFIG.upsert_batch])
-    return len(points), skipped
+        written_idx.append(orig_i)
+    upsert_batch = max(1, int(_CONFIG.upsert_batch or 64))  # 誤設 0 不炸，逐點寫入
+    for j in range(0, len(points), upsert_batch):
+        client.upsert(collection_name=_CONFIG.collection, points=points[j:j + upsert_batch])
+    for i in written_idx:
+        src = batch_metas[i].get("source", "")
+        done_by_source[src] = done_by_source.get(src, 0) + 1
+    return len(points), skipped, done_by_source
 
 
 _INGEST_CACHE_NAME = ".ingest_cache.json"
@@ -665,10 +836,21 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
     on_progress(done, total, rel)：可選進度回調，拋錯不中斷匯入。
     """
     _sync_config()
-    root = Path(folder)
+    if isinstance(folder, str) and (folder.startswith("~/") or folder.startswith("~\\")):
+        root = Path(folder).expanduser()
+    else:
+        # 裸 ~ 不展開（否則吞掉整個家目錄），維持找不到的明確報錯
+        root = Path(folder)
     if not root.is_dir():
         raise FileNotFoundError(f"匯入資料夾不存在：{folder}")
-    files = sorted([p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES and p.is_file() and p.name != _INGEST_CACHE_NAME])
+    # 遞迴掃支援副檔名＋實體檔，匯入快取檔本身永遠排除
+    cands = [p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES and p.is_file() and p.name != _INGEST_CACHE_NAME]
+    links = sorted({str(p) for p in cands if p.is_symlink()})
+    if links:
+        # symlink 指向 notes 外的外部內容不匯入，僅匯入實體檔
+        shown = "、".join(s[:60] for s in links[:5])
+        logger.warning("跳過 %d 個 symlink（僅匯入實體檔）：%s", len(links), shown)
+    files = sorted([p for p in cands if not p.is_symlink()])
     if not files:
         logger.warning("%s 內沒有支援的檔案（支援：%s），可先丟筆記進去", folder, sorted(SUPPORTED_SUFFIXES))
         return 0
@@ -678,22 +860,43 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
     skipped_unchanged = 0
     skipped_files = 0
     skipped_cached = 0
-    pending_chunks: list[str] = []
-    pending_metas: list[dict[str, str]] = []
+    pending_chunks: deque[str] = deque()
+    pending_metas: deque[dict[str, str]] = deque()
     file_count = 0
     ingest_cache = _load_ingest_cache(root)
     touched: dict[str, dict[str, object]] = {}
 
+    file_totals: dict[str, int] = {}
+    file_done: dict[str, int] = {}
+
     def _drain() -> tuple[int, int]:
-        """清餘批：把暫存塊嵌入寫入並累計計數，回 (寫入數, 跳過數)。」"""
-        nonlocal total, skipped_unchanged, pending_chunks, pending_metas
+        """清一批 embed_batch，大檔溢出時由呼叫端多次呼叫；小檔殘留併入下一檔，最後統一收尾。
+
+        跨檔批量：同批可混多檔，_flush_batch 回的各來源完成數精確歸因，
+        嵌入失敗的塊不計完成，下次匯入會重試補寫。
+        """
+        nonlocal total, skipped_unchanged
         if not pending_chunks:
             return (0, 0)
-        written, skipped = _flush_batch(client, pending_chunks, pending_metas, ensured)
+        take = min(len(pending_chunks), max(1, int(_CONFIG.embed_batch or 32)))
+        # C4：deque 左端彈出 O(1)，舊寫法全切片複製 O(n)，大批量匯入省吞吐
+        batch_chunks = [pending_chunks.popleft() for _ in range(take)]
+        batch_metas = [pending_metas.popleft() for _ in range(take)]
+        res = _flush_batch(client, batch_chunks, batch_metas, ensured)
+        if len(res) == 3:
+            written, skipped, done_by_source = res
+        else:  # 相容舊 mock 只回 (寫入, 跳過)：按批內比例估算歸因
+            written, skipped = res  # type: ignore[misc]
+            done_by_source = {}
+            done_total = written + skipped
+            if done_total >= len(batch_chunks):
+                for m in batch_metas:
+                    src = m.get("source", "")
+                    done_by_source[src] = done_by_source.get(src, 0) + 1
         total += written
         skipped_unchanged += skipped
-        pending_chunks = []
-        pending_metas = []
+        for src, n in done_by_source.items():
+            file_done[src] = file_done.get(src, 0) + n
         return (written, skipped)
 
     def _report(done: int, rel: str) -> None:
@@ -709,7 +912,7 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
     for idx, fp in enumerate(files):
         try:
             rel = str(fp.relative_to(root))
-        except ValueError:
+        except ValueError:  # 理論上不會發生（檔就是從 root 掃出來的），保險起見退回檔名
             rel = fp.name
         try:
             st = fp.stat()
@@ -738,24 +941,22 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
             continue
         file_count += 1
         touched[rel] = {"mtime": st.st_mtime, "size": st.st_size, "ok": False}
-        file_written = 0
-        file_skipped = 0
+        file_totals[rel] = len(chunks)
         for chunk in chunks:
             pending_chunks.append(chunk)
             pending_metas.append({"source": rel, "text": chunk})
-            if len(pending_chunks) >= _CONFIG.embed_batch:
-                w, s = _drain()
-                file_written += w
-                file_skipped += s
-        # 檔尾清餘批，確保不與下一檔混批，逐檔歸因
-        w, s = _drain()
-        file_written += w
-        file_skipped += s
+            # 大檔溢出時立即清一批，小檔殘留併入下一檔（跨檔批量省嵌入呼叫）
+            while len(pending_chunks) >= _CONFIG.embed_batch:
+                _drain()
+        _report(idx + 1, rel)
+    # 收尾：把跨檔殘留按批量清完，再按各來源完成數判定整檔成功
+    while pending_chunks:
+        _drain()
+    for rel, total_chunks in file_totals.items():
         # P15：完成數＝寫入＋未變跳過；等於總塊數才算整檔成功。
         # 部分嵌入失敗若誤標 ok，檔案級快取（mtime＋size）會永久跳過壞塊不再補。
-        if file_written + file_skipped >= len(chunks):
+        if file_done.get(rel, 0) >= total_chunks:
             touched[rel]["ok"] = True
-        _report(idx + 1, rel)
     ingest_cache.update(touched)
     _save_ingest_cache(root, ingest_cache)
     if total == 0:
@@ -763,6 +964,65 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
         return 0
     logger.info("共 %d 個檔（有效 %d，快取跳過 %d，跳過檔 %d，未變跳過 %d 塊），已寫入 %d 點到 %s。", len(files), file_count, skipped_cached, skipped_files, skipped_unchanged, total, _CONFIG.collection)
     return total
+
+
+# E1 短路可觀測：可判定次數／實際觸發次數（測試可重置；eval 讀快照算精度）
+SHORTCUT_TOTAL: int = 0
+SHORTCUT_FIRED: int = 0
+_SHORTCUT_LOCK = threading.Lock()  # F1：eval 並行時計數不丟失
+
+
+def shortcut_stats() -> dict[str, int]:
+    """短路計數快照（eval／觀測用）。"""
+    with _SHORTCUT_LOCK:
+        return {"total": SHORTCUT_TOTAL, "fired": SHORTCUT_FIRED}
+
+
+def _rerank_disabled() -> bool:
+    """重排是否停用：總開關關閉或後端指定 none"""
+    try:
+        if not bool(_config.RERANK_ENABLE):
+            return True
+        return str(_config.RERANK_BACKEND or "").strip().lower() == "none"
+    except Exception:
+        return False
+
+
+def _rerank_shortcut_hit(hits: list[dict[str, str]]) -> bool:
+    """C2 向量高分短路：top1 餘弦分達標且斷層領先次名時回 True，上層跳過 CPU 重排。
+
+    壞分數（缺失／非數字／nan／inf）一律回 False 走正常重排，不擋路。
+    E2 量尺護欄：餘弦分應落在 [-1, 1]（浮點塵埃放寬萬分之一），其它距離量尺
+    （DOT／EUCLID 大值）直接放棄短路——與 _rag_adequate 只對 0~1 量尺用地板同哲學。
+    """
+    try:
+        if not bool(_config.RERANK_SHORTCUT):
+            return False
+        lo = float(_config.RERANK_SHORTCUT_MIN)
+        gap = float(_config.RERANK_SHORTCUT_GAP)
+    except Exception:
+        return False
+    try:
+        has_threshold = float(_config.RERANK_THRESHOLD) > float("-inf")
+    except Exception:
+        has_threshold = False
+    if has_threshold:
+        return False  # F0：有設門檻走重排＋過濾，向量分與重排分量尺不同不可混用（預設 -inf 不影響）
+    scores: list[float] = []
+    for h in hits:
+        try:
+            v = float(str(h.get("score", "") or ""))
+        except (TypeError, ValueError):
+            return False
+        if v != v or v in (float("inf"), float("-inf")):
+            return False
+        if not (-1.0001 <= v <= 1.0001):
+            return False
+        scores.append(v)
+    if len(scores) < 2:
+        return False
+    ordered = sorted(scores, reverse=True)
+    return ordered[0] >= lo and (ordered[0] - ordered[1]) >= gap
 
 
 def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
@@ -780,7 +1040,8 @@ def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
         if qvec is None:
             return []
         client = _client()
-        recall = max(limit, _CONFIG.rerank_recall)
+        # C1：重排停用時按需寬取（省 Qdrant payload）；啟用時維持寬取給評審挑
+        recall = limit if _rerank_disabled() else max(limit, _CONFIG.rerank_recall)  # 先寬取再重排取精華，寧可多撈幾塊給評審挑
         res = client.query_points(collection_name=_CONFIG.collection, query=qvec, limit=recall, with_payload=True)
         hits: list[dict[str, str]] = []
         for pt in res.points:
@@ -798,6 +1059,15 @@ def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
             return []
         if len(hits) <= limit:
             return hits
+        global SHORTCUT_TOTAL, SHORTCUT_FIRED
+        with _SHORTCUT_LOCK:
+            SHORTCUT_TOTAL += 1
+        # C2：向量高分短路——top1 斷層領先時跳過 CPU 重排（約省 20 秒），直接取原順序
+        if _rerank_shortcut_hit(hits):
+            with _SHORTCUT_LOCK:
+                SHORTCUT_FIRED += 1
+            logger.debug("觀測 向量高分短路，跳過重排")
+            return hits[:limit]
         try:
             return _rerank(q, hits, top_k=limit)
         except Exception as e:
@@ -808,8 +1078,15 @@ def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
         return []
 
 
-def main() -> None:
-    """命令列入口：--ingest 匯入，--query 測試查詢。」"""
+def main() -> int:
+    """命令列入口：--ingest 匯入，--query 測試查詢；回 0 成功、1 匯入失敗（腳本可接住）。"""
+    try:  # Windows 主控台／管線統一 UTF-8，與 chat_cli／eval 同款保護
+        import sys as _sys
+
+        if _sys.stdout is not None:
+            _sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - 執行期才有
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description="匯入筆記到 Qdrant 或測試查詢")
     ap.add_argument("--ingest", default="", help="要匯入的資料夾，例如 notes")
     ap.add_argument("--query", default="", help="測試查詢，例如 '台北天氣如何'")
@@ -827,8 +1104,9 @@ def main() -> None:
 
         try:
             ingest_folder(args.ingest, on_progress=_on_progress if args.progress else None)
-        except FileNotFoundError as e:
+        except Exception as e:  # 路徑不存在、Qdrant 連不上都印友好訊息，不噴 traceback
             print(f"匯入失敗：{e}")
+            return 1
     elif args.query:
         hits = search_local(args.query, limit=args.limit)
         if not hits:
@@ -839,7 +1117,8 @@ def main() -> None:
             print(f"[{i}] 來源：{h['source']}{suffix}\n{h['text']}\n")
     else:
         ap.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

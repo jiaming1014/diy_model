@@ -7,12 +7,9 @@
 4. reranker._apply_threshold：門檻過濾、至少留 1 條
 """
 
-import sys
 from pathlib import Path
 
-# 讓 pytest 從專案根或 diy_model 內跑都找得到模組
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+# sys.path 由 tests/conftest.py 集中設定（專案根），故可直接匯入模組
 from chat_core import ChatMessage, _format_rag_results, _trim_hist, backtrace  # noqa: E402
 from eval import _check_keywords  # noqa: E402
 from rag_qdrant import _stable_id  # noqa: E402

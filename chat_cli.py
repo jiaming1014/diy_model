@@ -5,7 +5,7 @@
 你打一句，它回一句，一直循環，直到你說掰掰。
 
 【怎麼離開？】
-輸入 q、quit、exit、離開、結束、掰掰、再見，或按 Ctrl+C / Ctrl+D 都可以優雅離開。
+輸入 q、quit、exit、離開、結束、退出、掰掰、再見，或按 Ctrl+C / Ctrl+D 都可以優雅離開。
 空行會視為「還沒想好」，直接等下一句，不會關店。
 
 【對話內指令】
@@ -17,10 +17,11 @@
 - python chat_cli.py --model llama3.2:1b：指定模型
 - python chat_cli.py --no-search：只關上網搜尋（本機寫檔、播音樂照常）
 - python chat_cli.py --no-history：不載入／不存歷史
-- python chat_cli.py --health：檢查重排後端與 Qdrant 連線後結束（P15）
+- python chat_cli.py --health：檢查重排、Qdrant、嵌入／聊天模型與工作區後結束（P15）
 """
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -28,22 +29,27 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import cast
 
 from chat_core import OLLAMA_MODEL as _DEFAULT_MODEL
-from chat_core import ChatState, chat_w, get_last_rag, get_last_sources
+from chat_core import ChatMessage, ChatState, chat_w, get_last_rag, get_last_sources
 from chat_core import DEFAULT_SYS_MSG  # P17：系統提示唯一真相在 chat_core
 import chat_core as _core
 
 sys_msg = DEFAULT_SYS_MSG  # 相容舊匯入：值與 chat_core.DEFAULT_SYS_MSG 同一內容
 MODEL = _DEFAULT_MODEL
-_QUIT_CMDS = {"q", "quit", "exit", "離開", "結束", "掰掰", "再見"}
+_QUIT_CMDS = {"q", "quit", "exit", "離開", "結束", "退出", "掰掰", "再見"}
 _DEFAULT_HIST = Path.home() / ".diy_model_hist.json"  # 相容快照，運行請走 _hist_path()
 _hist_lock = threading.Lock()  # 存檔鎖，同進程多執行緒不互踩
 
 
 def _hist_path() -> Path:
-    """每次讀環境變數，改 DIY_HIST_FILE 不用重啟｜新手：地址每次出門現查，不抄舊紙條。」"""
-    return Path(os.getenv("DIY_HIST_FILE", str(_DEFAULT_HIST)))
+    """每次讀環境變數，改 DIY_HIST_FILE 不用重啟；空字串視為沒設，回退預設｜新手：地址每次出門現查，不抄舊紙條。」"""
+    raw = (os.getenv("DIY_HIST_FILE", "") or "").strip()
+    if not raw or raw == "~":
+        return _DEFAULT_HIST
+    p = Path(raw)
+    return p.expanduser() if raw.startswith("~/") or raw.startswith("~\\") else p
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-search", action="store_true", help="只關上網搜尋（本機寫檔、播音樂、查日期照常）")
     ap.add_argument("--verbose", action="store_true", help="顯示降級等除錯訊息")
     ap.add_argument("--no-history", action="store_true", help="不載入／不存歷史")
-    ap.add_argument("--health", action="store_true", help="檢查重排後端、Qdrant 連線與工作區可寫後結束（不做對話）")
+    ap.add_argument("--health", action="store_true", help="檢查重排、Qdrant、嵌入／聊天模型與工作區可寫後結束（不做對話）")
     return ap.parse_args(argv)
 
 
@@ -67,40 +73,32 @@ def _hist_keep_n() -> int:
 
 def _content_key(role: object, content: object) -> tuple:
     """去重鍵只存雜湊，不存全文，避免長問答撐大集合。」"""
-    text = content if isinstance(content, str) else str(content or "")
+    text = content if isinstance(content, str) else ("" if content is None else str(content))
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return (role, len(text), digest)
 
 
 def _trim_tail_to_budget(msgs: list[dict]) -> list[dict]:
-    """按 HIST_MAX_CHARS 字數＋token 雙預算從舊裁剪，與 chat_core._trim_hist 同尺。」"""
+    """按 HIST_MAX_CHARS 雙預算從舊裁剪，轉調 chat_core._trim_hist 保單一真相（回新清單，不動原輸入）。"""
+    buf = [dict(m) for m in msgs]  # 淺拷貝一份再裁，原輸入保持不動
     try:
-        budget = int(_core.HIST_MAX_CHARS)
+        _core._trim_hist(cast(list[ChatMessage], buf))
     except Exception:
         return msgs
-    try:
-        tok_len = _core._content_tokens
-    except Exception:
-        tok_len = lambda s: len(s or "")  # noqa: E731 - 退化字數
-    total_chars = sum(len(str(m.get("content", "") or "")) for m in msgs)
-    total_toks = sum(tok_len(str(m.get("content", "") or "")) for m in msgs)
-    i = 0
-    while i < len(msgs) and (total_chars > budget or total_toks > budget):
-        total_chars -= len(str(msgs[i].get("content", "") or ""))
-        total_toks -= tok_len(str(msgs[i].get("content", "") or ""))
-        i += 1
-    # 保持 user→assistant 成對：若從 assistant 開始多裁一則
-    tail = msgs[i:]
-    if len(tail) % 2 == 1 and tail and tail[0].get("role") == "assistant":
-        tail = tail[1:]
-    return tail
+    return buf
+
+
+_HIST_FILE_MAX_BYTES: int = 1_000_000  # 歷史檔讀取上限，被外部撐大時從空開始不硬讀
 
 
 def _load_history(state: ChatState, path: Path | None = None) -> None:
-    """載入上次存的問答，壞檔當無歷史｜新手：開店先把上次的小抄拿出來。」"""
+    """載入上次存的問答，壞檔／巨檔當無歷史｜新手：開店先把上次的小抄拿出來。」"""
     p = path if path is not None else _hist_path()
     try:
         if not p.is_file():
+            return
+        if p.stat().st_size > _HIST_FILE_MAX_BYTES:
+            logging.getLogger(__name__).warning("歷史檔過大（%d 位元組），已從空開始：%s", p.stat().st_size, p)
             return
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, list):
@@ -119,9 +117,12 @@ def _save_history(state: ChatState, path: Path | None = None) -> None:
             merged: list[dict] = []
             if p.is_file():
                 try:
-                    old = json.loads(p.read_text(encoding="utf-8"))
-                    if isinstance(old, list):
-                        merged.extend([m for m in old if isinstance(m, dict)])
+                    if p.stat().st_size > _HIST_FILE_MAX_BYTES:
+                        logging.getLogger(__name__).warning("歷史舊檔過大，跳過合併直接覆寫：%s", p)
+                    else:
+                        old = json.loads(p.read_text(encoding="utf-8"))
+                        if isinstance(old, list):
+                            merged.extend([m for m in old if isinstance(m, dict) and isinstance(m.get("content"), str) and isinstance(m.get("role"), str)])
                 except Exception:
                     pass  # 舊檔壞掉當空的，直接覆寫
             merged.extend([{"role": m["role"], "content": m["content"]} for m in state.hist])
@@ -134,7 +135,11 @@ def _save_history(state: ChatState, path: Path | None = None) -> None:
                     seen.add(key)
                     dedup.append(m)
             dedup.reverse()
-            tail = _trim_tail_to_budget(dedup[-_hist_keep_n():])
+            tail = _trim_tail_to_budget(dedup[-_hist_keep_n():])  # 取最後 N 組（最新的留，舊的裁）
+            for m in tail:  # 模型回覆若夾代理字會炸存檔致永遠存不了，先消毒（正常字串無影響）
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    m["content"] = c.encode("utf-8", "ignore").decode("utf-8")
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_text(json.dumps(tail, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -172,7 +177,7 @@ def _ingest_target(cmd: str) -> str | None:
     s = cmd.strip()
     if s != "/ingest" and not s.startswith("/ingest "):
         return None
-    arg = s[len("/ingest"):].strip().strip("\"'")
+    arg = s[len("/ingest"):].strip().strip("\"'")  # 去掉前後引號，貼上含空格路徑也不怕
     if arg:
         return arg
     return str(_core._workspace_root())
@@ -189,6 +194,7 @@ def _run_ingest_command(cmd: str) -> None:
         print(f"開始匯入：{target}", flush=True)
         n = rag_qdrant.ingest_folder(
             target,
+            # 進度回調簽名 (已完成數, 總數, 檔名)：逐檔即時印，匯入大資料夾才知道卡在哪
             on_progress=lambda done, total, rel: print(f"[{done}/{total}] {rel}", flush=True),
         )
     except Exception as e:
@@ -198,42 +204,115 @@ def _run_ingest_command(cmd: str) -> None:
 
 
 def _run_health_check(model: str) -> int:
-    """--health：檢查重排後端、Qdrant 連線與工作區可寫，回 0 全通、1 有缺（P15）。
+    """--health：檢查重排後端、Qdrant 連線、嵌入／聊天模型與工作區可寫，回 0 全通、1 有缺（P15）。
 
-        唯讀操作、不進對話迴圈；聊天模型與 Ollama 的實際可用性在對話時驗證。
+        四路 I/O 探測並行（各帶約 5 秒逾時），輸出保持固定順序；工作區會建目錄＋寫探針檔（用完即刪），其餘唯讀。
+        不進對話迴圈。
     """
     ok = True
-    try:
-        import reranker as _rr
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as _pool:
+        # 開關判斷是便宜本地讀，主線先算；慢 I/O 四路並行，Ollama 全掛時約 5 秒收斂
+        try:
+            import reranker as _rr
 
-        if (not _rr.RERANK_ENABLE) or _rr.RERANK_BACKEND == "none":
+            _rerank_off = (not _rr.RERANK_ENABLE) or _rr.RERANK_BACKEND == "none"
+        except Exception:
+            _rerank_off = False
+
+        def _do_rerank() -> dict:
+            """重排探測（函式內現 import，測試 mock 點不變）。"""
+            from reranker import probe_availability
+
+            return probe_availability()
+
+        _f_rerank = None if _rerank_off else _pool.submit(_do_rerank)
+        try:
+            import rag_qdrant
+
+            try:
+                rag_qdrant._sync_config()
+            except Exception:
+                pass
+            _rag_import_ok = True
+        except Exception as e:
+            print(f"Qdrant：不可用（{e}）", flush=True)
+            ok = False
+            _rag_import_ok = False
+
+        def _do_qdrant():
+            """Qdrant 收藏集列舉（含連線）。"""
+            return rag_qdrant._client().get_collections()
+
+        def _do_embed() -> bool:
+            """嵌入模型探測。"""
+            return rag_qdrant.probe_embed()
+
+        def _do_chat() -> bool:
+            """聊天模型探測。"""
+            from ollama_shared import probe_model
+
+            return probe_model(model, _ollama_timeout)
+
+        try:
+            import config as _cfg
+
+            rag_on = bool(_cfg.RAG_ENABLE)
+            _ollama_timeout = float(_cfg.OLLAMA_TIMEOUT)
+        except Exception:
+            rag_on, _ollama_timeout = True, 300.0
+        _f_qdrant = _pool.submit(_do_qdrant) if _rag_import_ok else None
+        _f_embed = None if not rag_on else _pool.submit(_do_embed)
+        _f_chat = _pool.submit(_do_chat)
+
+        # 依固定順序取結果印出（輸出順序不變）
+        if _f_rerank is None:
             # P22：刻意停用不算故障，印狀態但不判定失敗
             print("重排：已停用（RERANK_ENABLE=0 或 RERANK_BACKEND=none）", flush=True)
         else:
-            from reranker import probe_availability
-
-            avail = probe_availability()
-            print(f"重排 CrossEncoder：{'可用' if avail.get('crossencoder') else '不可用'}", flush=True)
-            print(f"重排 LLM 備援：{'可用' if avail.get('llm') else '不可用'}", flush=True)
-            if not avail.get("crossencoder") and not avail.get("llm"):
+            try:
+                _avail_rerank = _f_rerank.result()
+                print(f"重排 CrossEncoder：{'可用' if _avail_rerank.get('crossencoder') else '不可用'}", flush=True)
+                print(f"重排 LLM 備援：{'可用' if _avail_rerank.get('llm') else '不可用'}", flush=True)
+                if not _avail_rerank.get("crossencoder") and not _avail_rerank.get("llm"):
+                    ok = False
+            except Exception as e:
+                print(f"重排探測失敗：{e}", flush=True)
                 ok = False
-    except Exception as e:
-        print(f"重排探測失敗：{e}", flush=True)
-        ok = False
-    try:
-        import rag_qdrant
-
-        collections = rag_qdrant._client().get_collections()
-        names = [getattr(c, "name", str(c)) for c in getattr(collections, "collections", [])]
-        url = rag_qdrant.get_config().url
-        print(f"Qdrant：可用（{url}，收藏集：{', '.join(names) if names else '無'}）", flush=True)
-    except Exception as e:
-        print(f"Qdrant：不可用（{e}）", flush=True)
-        ok = False
+        if _f_qdrant is not None:
+            try:
+                collections = _f_qdrant.result()
+                names = [getattr(c, "name", str(c)) for c in getattr(collections, "collections", [])]  # mock 或新版欄位名變了也不炸
+                url = rag_qdrant.get_config().url
+                print(f"Qdrant：可用（{url}，收藏集：{', '.join(names) if names else '無'}）", flush=True)
+            except Exception as e:
+                print(f"Qdrant：不可用（{e}）", flush=True)
+                ok = False
+        if _f_embed is None:
+            # P22 慣例：刻意停用不算故障，印狀態但不判定失敗
+            print("嵌入模型：已停用（RAG_ENABLE=0）", flush=True)
+        else:
+            try:
+                embed_name = rag_qdrant.get_config().embed_model
+                _avail_embed = _f_embed.result()
+                print(f"嵌入模型：{'可用' if _avail_embed else '不可用'}（{embed_name}）", flush=True)
+                if not _avail_embed:
+                    ok = False
+            except Exception as e:
+                print(f"嵌入模型探測失敗：{e}", flush=True)
+                ok = False
+        try:
+            chat_ok = _f_chat.result()
+            print(f"聊天模型：{'可用' if chat_ok else '不可用'}（{model}）", flush=True)
+            if not chat_ok:
+                ok = False
+        except Exception as e:
+            print(f"聊天模型探測失敗：{e}，啟動後實際對話時驗證", flush=True)
+            ok = False
     try:
         root = _core._workspace_root()
         probe = root / ".health_probe"
         try:
+            # 寫得進又刪得掉才算可用，只讀目錄存在不算數
             probe.write_text("ok", encoding="utf-8")
         finally:
             try:
@@ -244,7 +323,6 @@ def _run_health_check(model: str) -> int:
     except Exception as e:
         print(f"工作區：不可用（{e}）", flush=True)
         ok = False
-    print(f"聊天模型：{model}（啟動後實際對話時驗證）", flush=True)
     return 0 if ok else 1
 
 
@@ -271,8 +349,12 @@ def main(argv: list[str] | None = None) -> None:
     state = ChatState()
     if not args.no_history:
         _load_history(state)
-        # 相容舊寫法：把載入的歷史同步給全域，舊外掛讀 hist 不會空
-        _core.hist.extend([m for m in state.hist if m not in _core.hist])
+        # 相容舊寫法：把載入的歷史同步給全域，舊外掛讀 hist 不會空（集合比對取代 O(n²) 逐個比 dict）
+        _seen = {_content_key(m.get("role"), m.get("content")) for m in _core.hist}
+        for m in state.hist:
+            if _content_key(m.get("role"), m.get("content")) not in _seen:
+                _core.hist.append(m)
+                _seen.add(_content_key(m.get("role"), m.get("content")))
     print(f"小助理已啟動（模型：{model}，上網搜尋：{'開' if web_search else '關'}），輸入 q 可離開，/ingest 可匯入筆記。", flush=True)
     # P12 體感：有 prompt_toolkit 走歷史上下鍵＋持久歷史，缺套件退化 input
     _prompt = None
@@ -309,7 +391,7 @@ def main(argv: list[str] | None = None) -> None:
             if text == "/ingest" or text.startswith("/ingest "):
                 _run_ingest_command(text)
                 continue
-            print("小助理：", end="", flush=True)
+            print("小助理：", end="", flush=True)  # 先印前綴再一片片串流，像直播字幕
             try:
                 for reply in chat_w(sys_msg, text, search_g=True, web_search=web_search, model=model, state=state):
                     print(reply, end="", flush=True)

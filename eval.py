@@ -6,9 +6,12 @@
 靠肉眼每次重測太累，這支就是自動考卷：固定題目＋標準答案關鍵字，
 跑完直接給分數。
 
+【前置】
+需 Qdrant 可連線、已匯入筆記、ollama 有嵌入模型（＋模型層要聊天模型），否則檢索全空。
+注意：考題是針對範例筆記出的標準答案，用私人筆記跑低分屬正常，不代表 RAG 壞掉。
 【兩種模式】
 - python eval.py：只測「檢索層」（search_local 有沒有撈到），快、不花模型錢
-- python eval.py --with-model gemma4:31b-cloud：加測「模型層」
+- python eval.py --with-model llama3.2:1b：加測「模型層」
   （chat_w 的回覆有沒有採納筆記），慢、會打真實 Ollama
 
 【結束碼】
@@ -20,12 +23,17 @@ import logging
 import re
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - Windows 下重設 stdout 編碼
+try:
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - Windows 下重設 stdout 編碼
+except Exception:
+    pass
 
 import chat_core
 import config as _config
 from chat_core import DEFAULT_SYS_MSG  # P17：系統提示唯一真相在 chat_core
 from rag_qdrant import search_local
+from rag_qdrant import shortcut_stats as _shortcut_stats
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +79,8 @@ def _check_keywords(text: str, keywords: list[str]) -> list[str]:
     norm = text.lower()
     found: list[str] = []
     for kw in keywords:
-        if kw.lower().strip() and kw.lower().strip() in norm:
+        k = kw.lower().strip()
+        if k and k in norm:
             found.append(kw)
     return found
 
@@ -86,12 +95,18 @@ def _first_hit_rank(hits: list[dict], keywords: list[str]) -> int | None:
 
 
 def _eval_retrieval(case: dict) -> dict:
-    """檢索層：search_local 撈到的筆記有沒有含關鍵字，附 MRR 與召回率。」"""
+    """檢索層：search_local 撈到的筆記有沒有含關鍵字，附 MRR 與召回率。
+
+    E1：順手記錄短路是否觸發＋首命中是否含關鍵字（短路精度），供閾值調整看數據。
+    """
+    before = _shortcut_stats()
     hits = search_local(case["q"], limit=3)
+    after = _shortcut_stats()
+    fired = after["fired"] > before["fired"]
     blob = "\n".join(h.get("text", "") for h in hits)
     found = _check_keywords(blob, case["keywords"])
     rank = _first_hit_rank(hits, case["keywords"])
-    rr = (1.0 / rank) if rank else 0.0
+    rr = (1.0 / rank) if rank else 0.0  # MRR 取倒數排名：首筆命中得 1 分，第 2 名得 0.5，沒命中 0 分
     recall = (len(found) / len(case["keywords"])) if case["keywords"] else 1.0
     return {
         "q": case["q"],
@@ -102,6 +117,8 @@ def _eval_retrieval(case: dict) -> dict:
         "rank": rank,
         "rr": rr,
         "recall": recall,
+        "shortcut": fired,
+        "shortcut_precise": (rank == 1) if fired else None,
     }
 
 
@@ -138,12 +155,14 @@ def _eval_model(case: dict, model: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     """跑完全部考題，印成績單，回傳結束碼。」"""
     ap = argparse.ArgumentParser(description="RAG 品質評估")
-    ap.add_argument("--with-model", default="", help="加測模型層，例如 gemma4:31b-cloud")
+    ap.add_argument("--with-model", default="", help="加測模型層，例如 llama3.2:1b")
     ap.add_argument("--verbose", action="store_true", help="顯示詳細命中")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, force=True)
+    with_model = (args.with_model or "").strip()  # 空白字串視為沒給，不打模型直接出檢索成績
 
-    print(f"評估模型設定：OLLAMA_MODEL={_config.OLLAMA_MODEL}，EMBED_MODEL={_config.EMBED_MODEL}")
+    model_label = with_model if with_model else f"{_config.OLLAMA_MODEL}（檢索層未用）"
+    print(f"評估模型設定：MODEL={model_label}，EMBED_MODEL={_config.EMBED_MODEL}")
     print("=" * 60)
 
     results = [_eval_retrieval(c) for c in CASES]
@@ -158,11 +177,18 @@ def main(argv: list[str] | None = None) -> int:
     mrr = sum(r["rr"] for r in results) / len(results) if results else 0.0
     avg_recall = sum(r["recall"] for r in results) / len(results) if results else 0.0
     print(f"檢索：{ok}/{len(results)} 過 MRR：{mrr:.2f} 平均召回：{avg_recall:.2f}")
+    fired = [r for r in results if r.get("shortcut")]
+    precise = [r for r in fired if r.get("shortcut_precise")]
+    print(f"短路：觸發 {len(fired)}/{len(results)}，首命中精確 {len(precise)}/{len(fired) if fired else 0}（調閾值看這行）")
 
-    if args.with_model:
+    if with_model:
         print("=" * 60)
         m_cases = [c for c in CASES if c.get("model")]
-        m_results = [_eval_model(c, args.with_model) for c in m_cases]
+        # F1：各例獨立 ChatState，線程池並行省數分鐘等待；map 保序，成績單順序不變
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(4, len(m_cases)))) as ex:
+            m_results = list(ex.map(lambda c: _eval_model(c, with_model), m_cases))
         m_ok = sum(1 for r in m_results if r["pass"])
         for r in m_results:
             mark = "✅" if r["pass"] else "❌"

@@ -1,9 +1,6 @@
 """P5+P6 回歸測試：隔離引用／批次重排／歷史預算／匯入上限，不碰真網路。"""
 
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unittest import mock
 
@@ -33,7 +30,7 @@ class TestRerankBatch:
 
         docs = [{"text": f"doc {i}", "source": "s"} for i in range(10)]
         fake_model = mock.Mock()
-        fake_model.predict.side_effect = lambda pairs: [float(len(p[1])) for p in pairs]
+        fake_model.predict.side_effect = lambda pairs, **kw: [float(len(p[1])) for p in pairs]
         with mock.patch.object(r, "_load_cross_model", return_value=fake_model):
             with mock.patch.object(r, "RERANK_BATCH", 4):
                 out = r._rerank_cross("q", docs, top_k=3)
@@ -113,6 +110,21 @@ class TestHistoryBudget:
         import chat_core as c
 
         assert total <= int(c.HIST_MAX_CHARS) + 10000  # 去重＋預算後不無限成長
+
+    def test_surrogate_in_history_still_saves(self, tmp_path: Path) -> None:
+        """模型回覆夾代理字也存得下（先消毒），不永久寫死。」"""
+        import chat_cli
+        from chat_core import ChatState
+
+        st = ChatState()
+        st.hist.append({"role": "user", "content": "hi"})
+        st.hist.append({"role": "assistant", "content": "a\udcbfb"})
+        p = tmp_path / "h.json"
+        chat_cli._save_history(st, path=p)
+        import json
+
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert any("ab" in m.get("content", "") for m in data)
 
 
 class TestIngestLimits:

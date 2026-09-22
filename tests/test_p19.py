@@ -7,8 +7,6 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from unittest import mock
 
 import chat_core
@@ -44,9 +42,9 @@ class TestToolSubsets:
         assert names == {"get_today", "search_web", "play_youtube_music", "workspace_write_file", "workspace_make_dir"}
 
     def test_music_subset(self) -> None:
-        """音樂意圖只給播歌＋搜尋。」"""
+        """音樂意圖只給播歌＋搜尋＋日期（時間指涉用）。」"""
         names = {t["function"]["name"] for t in chat_core._tools(intent="music")}  # type: ignore[index]
-        assert names == {"play_youtube_music", "search_web"}
+        assert names == {"play_youtube_music", "search_web", "get_today"}
 
     def test_workspace_subset(self) -> None:
         """工作區意圖不給播歌工具。」"""
@@ -207,7 +205,41 @@ class TestP20Hardening:
             with mock.patch.object(rag_qdrant, "_client") as m_client:
                 with mock.patch.object(chat_cli._core, "_workspace_root", return_value=tmp_path):
                     m_client.return_value.get_collections.return_value = coll
-                    rc = chat_cli._run_health_check("m")
+                    # 嵌入／聊天探測不碰真 Ollama，否則無服務的 CI 必紅
+                    with mock.patch.object(rag_qdrant, "probe_embed", return_value=True):
+                        with mock.patch("ollama_shared.probe_model", return_value=True):
+                            rc = chat_cli._run_health_check("m")
         assert rc == 0
         assert "工作區：可用" in capsys.readouterr().out
         assert not (tmp_path / ".health_probe").exists()
+
+
+# ------------------------------------------------------------
+# 5. 工作區路徑邊界：磁碟機前綴與歷史路徑回退
+# ------------------------------------------------------------
+class TestWorkspacePathEdge:
+    def test_drive_letter_blocked(self, tmp_path: Path) -> None:
+        """C:foo 磁碟機相對路徑擋下（只在 Windows 有意義）。」"""
+        import os
+
+        import pytest
+
+        if os.name != "nt":
+            pytest.skip("磁碟機前綴只在 Windows 有意義")
+        with mock.patch.object(chat_core, "_workspace_root", return_value=tmp_path):
+            out = chat_core._run_tool("workspace_make_dir", {"path": "C:evil"}, "test")
+        assert "磁碟機" in out
+
+    def test_hist_path_empty_falls_back(self, monkeypatch) -> None:
+        """DIY_HIST_FILE 空字串回預設，不寫怪檔。」"""
+        import chat_cli
+
+        monkeypatch.setenv("DIY_HIST_FILE", "")
+        assert chat_cli._hist_path() == chat_cli._DEFAULT_HIST
+
+    def test_hist_path_tilde_expands(self, monkeypatch) -> None:
+        """~/ 開頭展開為家目錄。」"""
+        import chat_cli
+
+        monkeypatch.setenv("DIY_HIST_FILE", "~/diy_hist.json")
+        assert str(chat_cli._hist_path()) == str(Path.home() / "diy_hist.json")

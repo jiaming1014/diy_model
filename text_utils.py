@@ -26,6 +26,11 @@ _WEEKDAY_ZH: Final[tuple[str, ...]] = ("一", "二", "三", "四", "五", "六",
 _DATE_KEYWORDS: Final[tuple[str, ...]] = (
     "今天", "今日", "現在", "日期", "幾號", "星期", "禮拜", "時間", "幾點", "年月日",
 )
+# 實詞：單獨出現即算查日期；軟詞（今天／今日／現在）需搭配實詞，否則今日頭條、現在流行什麼會被誤判
+_DATE_CORE_KEYWORDS: Final[tuple[str, ...]] = (
+    "日期", "幾號", "星期", "禮拜", "時間", "幾點", "年月日",
+)
+_DATE_SOFT_KEYWORDS: Final[tuple[str, ...]] = ("今天", "今日", "現在")
 _WEATHER_KEYWORDS: Final[tuple[str, ...]] = (
     "天氣", "氣溫", "溫度", "下雨", "降雨", "降水", "颱風", "預報", "濕度", "晴", "多雲", "陰天",
 )
@@ -38,13 +43,13 @@ _CHITCHAT: Final[frozenset[str]] = frozenset(
 # P0 修正：移除過寬的泛時間詞（2026／今年／現況等），避免「今年筆記在哪」被誤判跳過 RAG；
 # 年齡類改交給工具迴圈的 LLM 自行判斷，不再強制即時。
 _REALTIME_KEYWORDS: Final[tuple[str, ...]] = (
-    "新聞", "最新", "股價", "匯率", "比特幣", "加密貨幣", "天氣", "氣溫",
+    "新聞", "最新", "股價", "匯率", "比特幣", "加密貨幣", "天氣", "氣溫", "下雨", "下雪",
     "颱風", "地震", "即時", "公告", "發布", "上市", "發表", "演出",
     "票價", "賽事", "比分", "排名", "榜單",
 )
-# 本地意圖關鍵字：含這些優先視為查本地筆記，不強制即時（除非同時命中強即時詞）
+# 本地意圖關鍵字：含這些優先視為查本地筆記，不強制即時，交給工具迴圈自行決定是否上網
 _LOCAL_KEYWORDS: Final[tuple[str, ...]] = (
-    "筆記", "專案", "資料夾", "嵌入", "收藏", "本地", "notes",
+    "筆記", "專案", "資料夾", "嵌入", "收藏", "本地", "notes", "note",
 )
 # P19 工具意圖：工作區檔案操作，命中即跳過 RAG（本地筆記幫不上寫檔）
 # P22 收緊：拿掉過寬的「寫一」「存到」，避免「寫一封信」「存到哪」誤判為寫檔請求
@@ -66,7 +71,7 @@ _MUSIC_PLAY_VERBS: Final[tuple[str, ...]] = ("播", "點", "放", "聽")
 _MUSIC_NOUNS: Final[tuple[str, ...]] = ("歌", "音樂", "單曲", "專輯", "youtube", "油管")
 _STRIP_EDGE_RE: Final[re.Pattern[str]] = re.compile(r"^[\s，。！？、；：,.!?;:～~\-—]+|[\s，。！？、；：,.!?;:～~\-—]+$")
 _QUERY_FILLER_RE: Final[re.Pattern[str]] = re.compile(
-    r"^(請問|請問一下|幫我查一下|幫我找一下|查一下|找一下|謝謝|麻煩)[，,。\s]*|[？?！!啊呢吧喔哦]+$"
+    r"^(請問一下|請問|幫我查一下|幫我找一下|查一下|找一下|謝謝|麻煩)[，,。\s]*|[？?！!啊呢吧喔哦]+$"
 )
 
 
@@ -88,7 +93,11 @@ def _strip_edge(text: str) -> str:
 
 
 def _is_date_query(query: str) -> bool:
-    """短句＋含日期關鍵字才算查日期，避免長問句被誤判。」"""
+    """短句＋含日期關鍵字才算查日期，避免長問句被誤判。
+
+    軟詞（今天／今日／現在）單獨出現不算，需搭配實詞或短到只剩它，
+    否則「今日頭條」「現在流行什麼」會被誤回今天幾號。
+    """
     text = _strip_edge(query)
     if not text:
         return False
@@ -98,7 +107,11 @@ def _is_date_query(query: str) -> bool:
         return False
     if any(kw in text for kw in _WEATHER_KEYWORDS):
         return False
-    return any(kw in text for kw in _DATE_KEYWORDS)
+    if any(kw in text for kw in _DATE_CORE_KEYWORDS):
+        return True
+    if any(kw in text for kw in _DATE_SOFT_KEYWORDS):
+        return len(compact) <= 4
+    return False
 
 
 def _is_chitchat(query: str) -> bool:
@@ -115,6 +128,7 @@ def _is_chitchat(query: str) -> bool:
         return text in _CHITCHAT
     if text in _CHITCHAT:
         return True
+    # 問候詞開頭＋多不超過 3 字也算（如 嗨嗨嗨、謝謝你），再長就是有事要問了
     return any(text.startswith(w) and len(text) - len(w) <= 3 for w in _CHITCHAT if w)
 
 
@@ -137,46 +151,112 @@ def _needs_realtime(query: str) -> bool:
 def _truncate_user_msg(msg: str) -> str:
     """使用者輸入截斷防爆：超 USER_MAX_CHARS 留頭＋註記，避免單輪撐爆上下文。」"""
     max_chars = _config.USER_MAX_CHARS
-    text = msg.strip() if isinstance(msg, str) else str(msg or "")
+    text = msg.strip() if isinstance(msg, str) else ("" if msg is None else str(msg))
+    # 管線／轉貼可能帶進孤立代理字（surrogates），會炸 json 存檔與模型序列化，入口先清掉
+    text = text.encode("utf-8", "ignore").decode("utf-8")
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "…（過長已截斷）"
 
 
-def _clean_query_for_search(query: str) -> str:
-    """規則式查詢清洗：去口語填充詞＋壓空白＋截斷，提高快取命中與檢索召回。」"""
-    max_chars = _config.SEARCH_QUERY_MAX_CHARS
-    text = _strip_edge(query.strip() if isinstance(query, str) else str(query or ""))
+def _clean_query_for_search(query: str, max_chars: int | None = None) -> str:
+    """規則式查詢清洗：去口語填充詞＋壓空白＋截斷，提高快取命中與檢索召回。
+
+    max_chars 沒給走搜尋預算；RAG 檢索可傳 RAG 預算用足額度。
+    """
+    budget = _config.SEARCH_QUERY_MAX_CHARS if max_chars is None else max(1, int(max_chars))
+    text = _strip_edge(query.strip() if isinstance(query, str) else ("" if query is None else str(query)))
     text = _QUERY_FILLER_RE.sub("", text).strip()
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:max_chars].strip()
+    return text[:budget].strip()
+
+
+# 去重時忽略的追蹤參數（utm 家族＋各平台點擊標記），其餘 query 保留以免不同文章誤判同一頁
+_TRACKING_PARAM_RE: Final[re.Pattern[str]] = re.compile(
+    r"([?&])(?:utm(?:_[a-z_]+)?|gclid|gbraid|wbraid|fbclid|msclkid|mc_cid|mc_eid|igshid)(=[^&]*)?",
+    re.IGNORECASE,
+)
 
 
 def _normalize_url(url: str) -> str:
-    """URL 去重鍵：小寫＋去尾斜線＋去追蹤參數。」"""
-    u = (url or "").strip().lower()
-    u = re.sub(r"[?#].*$", "", u).rstrip("/")
+    """URL 去重鍵：去 # 片段與追蹤參數＋去尾斜線；只小寫 scheme＋host（DNS 不分大小寫），path／query 保大小寫。」"""
+    raw = url.strip() if isinstance(url, str) else ("" if url is None else str(url))
+    u = re.sub(r"#.*$", "", raw)
+    # scheme＋host 小寫即可，path／query 原樣保留（Linux 路徑大小寫敏感）
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(u)
+        if parts.netloc:
+            netloc = parts.netloc if "@" in parts.netloc else parts.netloc.lower()
+            u = urlunsplit((parts.scheme.lower(), netloc, parts.path, parts.query, ""))
+    except Exception:
+        u = u.lower()
+    u = _TRACKING_PARAM_RE.sub(r"\1", u)
+    u = u.replace("?&", "?")
+    while "&&" in u:
+        u = u.replace("&&", "&")
+    u = re.sub(r"[?&]$", "", u).rstrip("/")
     return u
 
 
+# 含「遊戲」的問句不走寬鬆的「存檔」匹配（遊戲進度存檔是查資料不是寫檔）
+_GAME_WORDS: Final[tuple[str, ...]] = ("遊戲", "游戲", "game")
+_WORKSPACE_STRONG_KEYWORDS: Final[tuple[str, ...]] = tuple(kw for kw in _WORKSPACE_KEYWORDS if kw != "存檔")
+# 窄語境動作關鍵字：強關鍵字再去掉單純提及（工作區／目錄名），只剩動手做的動作
+_WORKSPACE_ACTION_KEYWORDS: Final[tuple[str, ...]] = tuple(
+    kw for kw in _WORKSPACE_STRONG_KEYWORDS if kw not in ("ai_workspace", "ai workspace", "工作區")
+)
+
+
 def _needs_workspace(query: str) -> bool:
-    """是否為工作區檔案操作（寫檔／建資料夾）｜新手：動手做檔案，就別浪費時間翻筆記。」"""
+    """是否為工作區檔案操作（寫檔／建資料夾）｜新手：動手做檔案，就別浪費時間翻筆記。
+
+    窄語境（遊戲／聽說）：單純提及不算，只認動作關鍵字；自訂目錄名提及也算。
+    """
     text = _strip_edge(query).lower()
     if not text:
         return False
-    return any(kw in text for kw in _WORKSPACE_KEYWORDS)
+    if any(w in text for w in _GAME_WORDS) or any(w in text for w in _HEARSAY_WORDS):
+        return any(kw in text for kw in _WORKSPACE_ACTION_KEYWORDS)
+    if any(kw in text for kw in _WORKSPACE_KEYWORDS):
+        return True
+    # 自訂目錄名：改名後提及新目錄名也算意圖（預設名已在關鍵字表內，不重複）
+    ws = (_config.WORKSPACE_DIRNAME or "").strip().lower()
+    return bool(ws) and ws not in ("ai_workspace", "ai workspace") and ws in text
+
+
+# 含「聽說」的問句不走寬鬆組合判斷（「聽說這首歌…」是打聽消息不是點歌），只認精確音樂關鍵字
+_HEARSAY_WORDS: Final[tuple[str, ...]] = ("聽說", "听说", "據說", "据说")
+_MUSIC_EXACT_KEYWORDS: Final[frozenset[str]] = frozenset({
+    "youtube", "油管", "播歌", "放歌", "聽歌", "播音樂", "放音樂", "聽音樂", "播放音樂",
+})
 
 
 def _needs_music(query: str) -> bool:
     """是否為音樂播放請求｜新手：聽歌不需翻筆記，直接開 YouTube。
 
     P22：除關鍵字硬比對外，「播放動詞＋音樂名詞」組合也算，涵蓋口語說法。
+    排除：含聽說只認精確關鍵字；含寫／創作且無明確音樂標記不算；
+    放首排除前字為開（開放首先）。
     """
     text = _strip_edge(query).lower()
     if not text:
         return False
-    if any(kw in text for kw in _MUSIC_KEYWORDS):
-        return True
+    if any(w in text for w in _HEARSAY_WORDS):
+        return any(kw in text for kw in _MUSIC_EXACT_KEYWORDS)
+    if (any(w in text for w in ("寫", "写", "創作", "创作")) and "播放" not in text
+            and not any(kw in text for kw in _MUSIC_EXACT_KEYWORDS)):
+        # 寫歌／創作是作曲查資料，不是點歌；有明確音樂標記（YouTube／播歌…）時不排除，交上層判衝突
+        return False
+    for kw in _MUSIC_KEYWORDS:
+        if kw == "放首":
+            # 「開放／开放首先登記」不是點歌：排除前字為開的命中（簡體开一起認）
+            if re.search(r"(?<![開开])放首", text):
+                return True
+            continue
+        if kw in text:
+            return True
     return any(v in text for v in _MUSIC_PLAY_VERBS) and any(n in text for n in _MUSIC_NOUNS)
 
 

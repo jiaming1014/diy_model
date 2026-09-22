@@ -1,0 +1,7 @@
+# diy_model 開發工具：測試與靜態檢查的版本單一來源。
+# 消費端：CI（.github/workflows/ci.yml）、requirements-optional.txt（-r 帶入）、
+# pyproject [project.optional-dependencies].dev（無法引用檔案，需人工同步）。
+# 三者一律以本檔版本為準，勿在別處另寫版本號。
+pytest==9.1.1
+ruff==0.16.8
+pyright==1.1.414

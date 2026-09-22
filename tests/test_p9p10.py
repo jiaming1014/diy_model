@@ -3,8 +3,6 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from unittest import mock
 
 
@@ -35,10 +33,16 @@ class TestPerFileOk:
         (tmp_path / "bad.md").write_text("bad content here", encoding="utf-8")
 
         def _fake_flush(client, chunks, metas, ensured):
-            """假寫入：bad.md 全失敗，其餘全成功。」"""
-            if any(m.get("source") == "bad.md" for m in metas):
-                return (0, 0)  # 嵌入全失敗
-            return (len(chunks), 0)
+            """假寫入：bad.md 全失敗，其餘全成功（相容跨檔混批逐來源歸因）。"""
+            done: dict[str, int] = {}
+            written = 0
+            for m in metas:
+                src = m.get("source", "")
+                if src == "bad.md":
+                    continue  # 該來源全失敗，不計完成
+                done[src] = done.get(src, 0) + 1
+                written += 1
+            return (written, 0, done)
 
         with mock.patch.object(rq, "_client"):
             with mock.patch.object(rq, "_flush_batch", side_effect=_fake_flush):

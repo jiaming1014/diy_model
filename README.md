@@ -13,7 +13,7 @@
 - **智慧分流**：問日期走捷徑；即時資訊直接搜網；本地可答就不打模型（P15 起單次生成）
 - **降級保證**：任何外部依賴（Ollama／Qdrant／搜尋）掛掉都有備案，不會整支炸
 - **快取**：搜尋結果＋查詢向量共用 LRU＋TTL 快取
-- **184 個測試**：全 mock、不碰網路，CI 可跑
+- **229 個測試**：全 mock、不碰網路，CI 可跑
 
 ## 系統需求
 
@@ -24,14 +24,14 @@
 ```bash
 docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
 ollama pull nomic-embed-text   # 嵌入模型（RAG 必需）
-# 聊天模型依你選用：本機如 llama3.2:1b／qwen3:8b；預設為 Ollama Cloud 的 gemma4:31b-cloud
+# 聊天模型依你選用：預設 llama3.2:1b，本機如 qwen3:8b、雲端如 gemma4:31b-cloud
 ```
 
 ## 安裝
 
 ```bash
-pip install -r requirements.txt            # 核心：聊天＋檢索＋測試
-pip install -r requirements-optional.txt   # 可選：PDF／DOCX／OCR／重排／tiktoken／prompt_toolkit
+pip install -r requirements.txt            # 核心：聊天＋檢索
+pip install -r requirements-optional.txt   # 可選：PDF／DOCX／OCR／重排／tiktoken／prompt_toolkit＋測試（pytest／ruff／pyright）
 ```
 
 ## 快速開始
@@ -48,15 +48,15 @@ python chat_cli.py --model llama3.2:1b
 python chat_cli.py --no-search      # 只關上網搜尋（寫檔／播音樂照常）
 python chat_cli.py --no-history
 
-# 4) 健康檢查（重排後端＋Qdrant 連線）
+# 4) 健康檢查（重排＋Qdrant＋嵌入／聊天模型＋工作區）
 python chat_cli.py --health
 
 # 5) 測試查詢本地筆記
 python rag_qdrant.py --query "台北天氣如何" --limit 3
 
-# 6) RAG 品質評估（--with-model 會打真實模型）
+# 6) RAG 品質評估（需先起 Qdrant＋匯入筆記；考題配範例筆記，私人筆記低分正常；--with-model 會打真實模型）
 python eval.py
-python eval.py --with-model gemma4:31b-cloud
+python eval.py --with-model llama3.2:1b
 ```
 
 ## 工具一覽
@@ -80,12 +80,13 @@ python eval.py --with-model gemma4:31b-cloud
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `OLLAMA_MODEL` | `gemma4:31b-cloud` | 聊天模型 |
-| `OLLAMA_TIMEOUT` | `120` | Ollama HTTP 逾時（秒） |
+| `OLLAMA_MODEL` | `llama3.2:1b` | 聊天模型 |
+| `OLLAMA_TIMEOUT` | `300` | Ollama HTTP 逾時（秒） |
 | `SEARCH_MAX_RESULTS` | `3` | 每次搜網取幾筆 |
 | `SEARCH_REGION` | `tw-twn` | DDGS 搜尋區域 |
 | `SEARCH_CACHE_TTL` | `300` | 搜尋快取秒數 |
 | `SEARCH_FAIL_CACHE_TTL` | `30` | 搜尋失敗空結果短快取秒數 |
+| `SEARCH_RETRIES` | `1` | 搜尋重試次數（總嘗試＝1＋重試） |
 | `HIST_MAX_CHARS` | `6000` | 歷史預算（字數＋token 雙尺） |
 | `HIST_SUMMARY_ENABLE` | `0` | 開 `1` 後，被裁的舊訊息改壓成滾動摘要 |
 | `MAX_TOOL_ROUNDS` | `2` | 工具呼叫最多幾輪 |
@@ -95,6 +96,12 @@ python eval.py --with-model gemma4:31b-cloud
 | `QDRANT_API_KEY` | （空） | Qdrant Cloud 等需驗證時使用 |
 | `EMBED_MODEL` | `nomic-embed-text` | 嵌入模型 |
 | `RERANK_BACKEND` | `auto` | `auto`／`crossencoder`／`llm`／`none` |
+| `RERANK_ENABLE` | `1` | 重排總開關；設 `0` 直接回向量順序（與 `BACKEND=none` 同效，並讓檢索按需少撈） |
+| `RERANK_THRESHOLD` | （不設限） | 最低分門檻，低於此分丟掉；**設了會停用高分短路**（向量分與重排分量尺不同） |
+| `VISION_MODEL` | `llava:latest` | 圖片匯入的視覺描述模型（缺 OCR 時用） |
+| `RERANK_SHORTCUT` | `1` | 向量高分短路開關，top1 斷層領先時跳過 CPU 重排 |
+| `RERANK_SHORTCUT_MIN` | `0.78` | 短路 top1 餘弦分門檻（D2 實測校準） |
+| `RERANK_SHORTCUT_GAP` | `0.06` | 短路 top1 與次名最小差距（D2 實測校準） |
 | `QUERY_REWRITE_LLM` | `0` | 開 `1` 多打一次模型改寫檢索關鍵字 |
 | `DIY_HIST_FILE` | `~/.diy_model_hist.json` | 歷史檔位置（每次讀取） |
 | `WORKSPACE_DIRNAME` | `AI_Workspace` | 工作區資料夾名（桌面下，寫檔／建資料夾沙盒） |
@@ -105,10 +112,17 @@ python eval.py --with-model gemma4:31b-cloud
 | `RERANK_QUERY_MAX_CHARS` | `500` | 重排打分提示詞的問題截斷字數 |
 | `RERANK_DOC_MAX_CHARS` | `2000` | CrossEncoder 配對的文件截斷字數 |
 
+## 效能備註（CPU 重排）
+
+實測無 GPU 時，CrossEncoder（bge-reranker-v2-m3）約 2 秒打一對，預設 10 個召回約 20 秒一問（機器忙時更久）。
+降本只有砍候選有效（`RERANK_RECALL`，已從 15 調到 10）；`RERANK_BATCH` 放大 CPU 也沒用（GPU 才有效），
+`RERANK_DOC_MAX_CHARS` 對預設切塊（數百字）等於沒切，不必動；趕時間可切 `RERANK_BACKEND=llm`（改走 Ollama 打分）或 `none`（直接用向量順序）。
+注意：`llm` 後端需要堪用的模型——本機 1b 小模型整批常解析失敗，掉進逐筆備援（上限 4 連打）實測 300 秒做不完。
+
 ## 測試與靜態檢查
 
 ```bash
-python -m pytest -q     # 184 passed，不碰真網路
+python -m pytest -q     # 229 passed，不碰真網路
 python -m ruff check .  # 靜態檢查（E/F）
 python -m pyright       # 型別檢查
 ```
@@ -123,10 +137,11 @@ diy_model/
 ├── rag_qdrant.py     # 筆記匯入＋向量檢索（Qdrant）
 ├── reranker.py       # 重排（CrossEncoder／Ollama LLM）
 ├── ttl_cache.py      # 共用 LRU＋TTL 快取
+├── ollama_shared.py  # 共用 Ollama client（依逾時快取，三模組同一份連線池）
 ├── config.py         # 全域設定唯一真相
 ├── eval.py           # RAG 品質評估（檢索層 MRR／模型層引用）
 ├── notes/            # 你的筆記放這裡
-└── tests/            # 184 個測試
+└── tests/            # 229 個測試
 ```
 
 ## 流程速覽

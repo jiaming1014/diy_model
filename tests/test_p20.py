@@ -3,8 +3,6 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from unittest import mock
 
 import pytest
@@ -118,7 +116,7 @@ class TestRerankTruncSync:
             c.refresh()
 
     def test_defaults(self) -> None:
-        """預設 500／2000，與舊寫死值一致。」"""
+        """預設 500／2000（召回文本僅數百字，DOC 截斷形同虛設，不必砍）。」"""
         import reranker as r
 
         assert r.RERANK_QUERY_MAX_CHARS == 500
@@ -294,6 +292,29 @@ class TestRerankProbeSwitch:
         coll = types.SimpleNamespace(collections=[types.SimpleNamespace(name="notes")])
         with mock.patch.object(rag_qdrant, "_client") as mc:
             mc.return_value.get_collections.return_value = coll
-            rc = chat_cli._run_health_check("m")
+            with mock.patch.object(rag_qdrant, "probe_embed", return_value=True):
+                with mock.patch("ollama_shared.probe_model", return_value=True):
+                    rc = chat_cli._run_health_check("m")
         assert rc == 0
         assert "已停用" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------
+# 11. 窄語境動作限定：遊戲／聽說只認動作，不認單純提及
+# ------------------------------------------------------------
+class TestWorkspaceNarrow:
+    def test_game_bare_mention_not_workspace(self) -> None:
+        """「遊戲工作區在哪」是打聽位置，走一般問答。」"""
+        assert chat_core._detect_intent("遊戲工作區在哪") is None
+
+    def test_game_action_still_workspace(self) -> None:
+        """窄語境＋動作（新增檔案）照走寫檔。」"""
+        assert chat_core._detect_intent("在遊戲mydocs新增檔案") == "workspace"
+
+    def test_hearsay_bare_not_workspace(self) -> None:
+        """「聽說有工作區這東西」是打聽，走一般問答。」"""
+        assert chat_core._detect_intent("聽說有工作區這東西") is None
+
+    def test_hearsay_action_still_workspace(self) -> None:
+        """聽說＋動作照走寫檔。」"""
+        assert chat_core._detect_intent("聽說工作區可以新增檔案") == "workspace"

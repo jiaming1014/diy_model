@@ -11,7 +11,7 @@
 舊的 `import chat_core`、`chat_core.OLLAMA_MODEL` 寫法照常用。
 
 【注意】
-環境變數在 import 時讀取一次，改了要重啟程式才生效。
+環境變數在 import 時讀取一次，之後改了可呼叫 config.refresh() 免重啟套用（會同步已載入模組）。
 唯一的例外是 chat_cli 的 DIY_HIST_FILE，它是每次用時現讀。
 """
 
@@ -32,12 +32,29 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _float_env(name: str, default: float) -> float:
-    """安全讀浮點環境變數，同上。」"""
+    """安全讀浮點環境變數，同上；nan／inf 視為寫壞回預設。」"""
     try:
-        return float(str(os.getenv(name, str(default))).strip())
+        v = float(str(os.getenv(name, str(default))).strip())
     except (ValueError, AttributeError):
         logger.warning("環境變數 %s 解析失敗，使用預設 %s", name, default)
         return default
+    if v != v or v in (float("inf"), float("-inf")):
+        logger.warning("環境變數 %s 非有限值，使用預設 %s", name, default)
+        return default
+    return v
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """布林開關：1／true／yes／on 開，0／false／no／off 關，不分大小寫；寫壞警告回預設。」"""
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "y", "on"):
+        return True
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    if not raw:
+        return default
+    logger.warning("環境變數 %s 非布林值，使用預設 %s", name, default)
+    return default
 
 
 def _threshold_env(name: str) -> float:
@@ -53,16 +70,14 @@ def _threshold_env(name: str) -> float:
 
 
 # --- 預設值唯一來源：模組頂層與 refresh() 共用同一批，避免兩處漂移（P15）---
-_DEF_OLLAMA_MODEL: str = "gemma4:31b-cloud"
-_DEF_OLLAMA_TIMEOUT: float = 120.0
+_DEF_OLLAMA_MODEL: str = "llama3.2:1b"
+_DEF_OLLAMA_TIMEOUT: float = 300.0
 _DEF_SEARCH_MAX_RESULTS: int = 3
 _DEF_MAX_TOOL_ROUNDS: int = 2
 _DEF_SEARCH_QUERY_MAX_CHARS: int = 200
 _DEF_SEARCH_TIMEOUT: float = 10.0
 _DEF_SEARCH_REGION: str = "tw-twn"
 _DEF_RAG_MAX_RESULTS: int = 3
-_DEF_ENABLED: str = "1"
-_DEF_DISABLED: str = "0"
 _DEF_OLLAMA_RETRIES: int = 1
 _DEF_SEARCH_CACHE_MAX: int = 128
 _DEF_SEARCH_CACHE_TTL: float = 300.0
@@ -82,7 +97,7 @@ _DEF_EMBED_MODEL: str = "nomic-embed-text"
 _DEF_VISION_MODEL: str = "llava:latest"
 _DEF_CHUNK_CHARS: int = 800
 _DEF_CHUNK_OVERLAP: int = 100
-_DEF_RERANK_RECALL: int = 15
+_DEF_RERANK_RECALL: int = 10  # CPU 實測約 2 秒一對，10 候選約 20 秒；要更快換後端或上 GPU
 _DEF_EMBED_BATCH: int = 32
 _DEF_UPSERT_BATCH: int = 64
 _DEF_CHUNK_MAX_TOKENS: int = 0
@@ -100,6 +115,10 @@ _DEF_RERANK_SNIPPET_CHARS: int = 300
 _DEF_RERANK_BATCH: int = 8
 _DEF_RERANK_QUERY_MAX_CHARS: int = 500
 _DEF_RERANK_DOC_MAX_CHARS: int = 2000
+_DEF_RERANK_SHORTCUT: bool = True  # C2：向量高分短路總開關，預設開（命中注定高時跳過 CPU 重排）
+_DEF_RERANK_SHORTCUT_MIN: float = 0.78  # C2：top1 餘弦分門檻（D2 實測：個人庫 verbatim 0.812、改寫查詢最高 0.691）
+_DEF_RERANK_SHORTCUT_GAP: float = 0.06  # C2：top1 與次名最小差距（D2 實測：verbatim 0.075、改寫最大 0.045）
+_DEF_SEARCH_RETRIES: int = 1  # C5：搜尋重試次數，總嘗試＝1＋重試（預設 2 次，與舊 range(2) 一致）
 _DEF_WORKSPACE_DIRNAME: str = "AI_Workspace"
 _DEF_WORKSPACE_MAX_FILE_CHARS: int = 100000
 _DEF_WORKSPACE_PATH_MAX_CHARS: int = 500
@@ -112,15 +131,16 @@ SEARCH_MAX_RESULTS: int = _int_env("SEARCH_MAX_RESULTS", _DEF_SEARCH_MAX_RESULTS
 MAX_TOOL_ROUNDS: int = _int_env("MAX_TOOL_ROUNDS", _DEF_MAX_TOOL_ROUNDS)
 SEARCH_QUERY_MAX_CHARS: int = _int_env("SEARCH_QUERY_MAX_CHARS", _DEF_SEARCH_QUERY_MAX_CHARS)
 SEARCH_TIMEOUT: float = _float_env("SEARCH_TIMEOUT", _DEF_SEARCH_TIMEOUT)
-SEARCH_REGION: str = os.getenv("SEARCH_REGION", _DEF_SEARCH_REGION).strip()  # DuckDuckGo 區域，預設台灣
+SEARCH_REGION: str = os.getenv("SEARCH_REGION", "").strip() or _DEF_SEARCH_REGION  # DuckDuckGo 區域，預設台灣；空字串回退預設
 RAG_MAX_RESULTS: int = _int_env("RAG_MAX_RESULTS", _DEF_RAG_MAX_RESULTS)
-RAG_ENABLE: bool = os.getenv("RAG_ENABLE", _DEF_ENABLED) != "0"
+RAG_ENABLE: bool = _bool_env("RAG_ENABLE", True)
 OLLAMA_RETRIES: int = _int_env("OLLAMA_RETRIES", _DEF_OLLAMA_RETRIES)
 SEARCH_CACHE_MAX: int = _int_env("SEARCH_CACHE_MAX", _DEF_SEARCH_CACHE_MAX)
 SEARCH_CACHE_TTL: float = _float_env("SEARCH_CACHE_TTL", _DEF_SEARCH_CACHE_TTL)  # 快取 5 分鐘過期，避免舊新聞殘留
 SEARCH_FAIL_CACHE_TTL: float = _float_env("SEARCH_FAIL_CACHE_TTL", _DEF_SEARCH_FAIL_CACHE_TTL)  # P18：搜尋失敗空結果短快取，壞查詢短時間內不再打網路
+SEARCH_RETRIES: int = _int_env("SEARCH_RETRIES", _DEF_SEARCH_RETRIES)  # C5：重試次數，總嘗試＝1＋重試
 HIST_MAX_CHARS: int = _int_env("HIST_MAX_CHARS", _DEF_HIST_MAX_CHARS)  # 歷史字數預算，超過從舊的裁
-HIST_SUMMARY_ENABLE: bool = os.getenv("HIST_SUMMARY_ENABLE", _DEF_DISABLED) == "1"  # P16：舊訊息改滾動摘要，預設關（會多打模型）
+HIST_SUMMARY_ENABLE: bool = _bool_env("HIST_SUMMARY_ENABLE", False)  # P16：舊訊息改滾動摘要，預設關（會多打模型）
 HIST_SUMMARY_MAX_CHARS: int = _int_env("HIST_SUMMARY_MAX_CHARS", _DEF_HIST_SUMMARY_MAX_CHARS)  # 摘要上限字數
 HIST_SUMMARY_MIN_DROPPED: int = _int_env("HIST_SUMMARY_MIN_DROPPED", _DEF_HIST_SUMMARY_MIN_DROPPED)  # 丟棄內容達此字數才值得摘要
 RAG_MAX_CHARS: int = _int_env("RAG_MAX_CHARS", _DEF_RAG_MAX_CHARS)  # 本地筆記字數預算，防止上下文爆量
@@ -129,7 +149,7 @@ SEARCH_MAX_CHARS: int = _int_env("SEARCH_MAX_CHARS", _DEF_SEARCH_MAX_CHARS)
 SEARCH_SNIPPET_CHARS: int = _int_env("SEARCH_SNIPPET_CHARS", _DEF_SEARCH_SNIPPET_CHARS)
 SEARCH_TITLE_CHARS: int = _int_env("SEARCH_TITLE_CHARS", _DEF_SEARCH_TITLE_CHARS)
 USER_MAX_CHARS: int = _int_env("USER_MAX_CHARS", _DEF_USER_MAX_CHARS)
-QUERY_REWRITE_LLM: bool = os.getenv("QUERY_REWRITE_LLM", _DEF_DISABLED) == "1"  # 預設關，開了才多打一次 LLM 改寫
+QUERY_REWRITE_LLM: bool = _bool_env("QUERY_REWRITE_LLM", False)  # 預設關，開了才多打一次 LLM 改寫
 # --- 工作區檔案工具（workspace_write_file／workspace_make_dir 在用）---
 WORKSPACE_DIRNAME: str = os.getenv("WORKSPACE_DIRNAME", _DEF_WORKSPACE_DIRNAME).strip() or _DEF_WORKSPACE_DIRNAME
 WORKSPACE_MAX_FILE_CHARS: int = _int_env("WORKSPACE_MAX_FILE_CHARS", _DEF_WORKSPACE_MAX_FILE_CHARS)
@@ -161,7 +181,7 @@ INGEST_TEXT_MAX_CHARS: int = _int_env("INGEST_TEXT_MAX_CHARS", _DEF_INGEST_TEXT_
 INGEST_DOCX_MAX_PARAS: int = _int_env("INGEST_DOCX_MAX_PARAS", _DEF_INGEST_DOCX_MAX_PARAS)
 
 # --- 重排（reranker.py 在用）---
-RERANK_ENABLE: bool = os.getenv("RERANK_ENABLE", _DEF_ENABLED) != "0"
+RERANK_ENABLE: bool = _bool_env("RERANK_ENABLE", True)
 RERANK_BACKEND: str = os.getenv("RERANK_BACKEND", _DEF_RERANK_BACKEND).strip().lower()
 RERANK_MODEL: str = os.getenv("RERANK_MODEL", _DEF_RERANK_MODEL)
 RERANK_LLM_MODEL: str = os.getenv("RERANK_LLM_MODEL", OLLAMA_MODEL)
@@ -170,6 +190,9 @@ RERANK_THRESHOLD: float = _threshold_env("RERANK_THRESHOLD")
 RERANK_BATCH: int = _int_env("RERANK_BATCH", _DEF_RERANK_BATCH)  # CrossEncoder 分批，避免大召回 OOM
 RERANK_QUERY_MAX_CHARS: int = _int_env("RERANK_QUERY_MAX_CHARS", _DEF_RERANK_QUERY_MAX_CHARS)  # P20：打分提示詞的問題截斷
 RERANK_DOC_MAX_CHARS: int = _int_env("RERANK_DOC_MAX_CHARS", _DEF_RERANK_DOC_MAX_CHARS)  # P20：CrossEncoder 配對的文件截斷
+RERANK_SHORTCUT: bool = _bool_env("RERANK_SHORTCUT", _DEF_RERANK_SHORTCUT)  # C2：高分短路開關
+RERANK_SHORTCUT_MIN: float = _float_env("RERANK_SHORTCUT_MIN", _DEF_RERANK_SHORTCUT_MIN)  # C2：top1 門檻
+RERANK_SHORTCUT_GAP: float = _float_env("RERANK_SHORTCUT_GAP", _DEF_RERANK_SHORTCUT_GAP)  # C2：領先差距
 
 
 # --- P18 節流：refresh 扇出對照表，某模組無相關異動時跳過其 _sync_config。
@@ -178,8 +201,9 @@ _SYNC_WATCH: dict[str, frozenset[str]] = {
     "chat_core": frozenset({
         "OLLAMA_MODEL", "OLLAMA_TIMEOUT", "SEARCH_MAX_RESULTS", "MAX_TOOL_ROUNDS",
         "SEARCH_QUERY_MAX_CHARS", "SEARCH_TIMEOUT", "SEARCH_REGION", "RAG_MAX_RESULTS",
+        "RAG_QUERY_MAX_CHARS",
         "RAG_ENABLE", "OLLAMA_RETRIES", "SEARCH_CACHE_MAX", "SEARCH_CACHE_TTL",
-        "SEARCH_FAIL_CACHE_TTL", "HIST_MAX_CHARS", "HIST_SUMMARY_ENABLE",
+        "SEARCH_FAIL_CACHE_TTL", "SEARCH_RETRIES", "HIST_MAX_CHARS", "HIST_SUMMARY_ENABLE",
         "HIST_SUMMARY_MAX_CHARS", "HIST_SUMMARY_MIN_DROPPED", "RAG_MAX_CHARS",
         "SEARCH_MAX_CHARS", "SEARCH_SNIPPET_CHARS", "SEARCH_TITLE_CHARS",
         "USER_MAX_CHARS", "QUERY_REWRITE_LLM",
@@ -191,6 +215,7 @@ _SYNC_WATCH: dict[str, frozenset[str]] = {
         "OLLAMA_TIMEOUT", "CHUNK_CHARS", "CHUNK_OVERLAP", "RERANK_RECALL", "EMBED_BATCH",
         "UPSERT_BATCH", "CHUNK_MAX_TOKENS", "QUERY_VEC_CACHE_MAX", "QUERY_VEC_CACHE_TTL",
         "RAG_QUERY_MAX_CHARS",
+        "RERANK_SHORTCUT", "RERANK_SHORTCUT_MIN", "RERANK_SHORTCUT_GAP",
         "INGEST_IMAGE_MAX_MB", "INGEST_PDF_MAX_PAGES", "INGEST_CSV_MAX_ROWS",
         "INGEST_TEXT_MAX_CHARS", "INGEST_DOCX_MAX_PARAS",
     }),
@@ -198,7 +223,7 @@ _SYNC_WATCH: dict[str, frozenset[str]] = {
         "RERANK_ENABLE", "RERANK_BACKEND", "RERANK_MODEL", "RERANK_LLM_MODEL",
         "RERANK_SNIPPET_CHARS", "RERANK_THRESHOLD", "RERANK_BATCH",
         "RERANK_QUERY_MAX_CHARS", "RERANK_DOC_MAX_CHARS",
-        "OLLAMA_TIMEOUT", "OLLAMA_MODEL",
+        "OLLAMA_TIMEOUT",
     }),
 }
 
@@ -210,7 +235,8 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     """
     global OLLAMA_MODEL, OLLAMA_TIMEOUT, SEARCH_MAX_RESULTS, MAX_TOOL_ROUNDS
     global SEARCH_QUERY_MAX_CHARS, SEARCH_TIMEOUT, SEARCH_REGION, RAG_MAX_RESULTS, RAG_ENABLE
-    global OLLAMA_RETRIES, SEARCH_CACHE_MAX, SEARCH_CACHE_TTL, SEARCH_FAIL_CACHE_TTL, HIST_MAX_CHARS
+    global OLLAMA_RETRIES, SEARCH_CACHE_MAX, SEARCH_CACHE_TTL, SEARCH_FAIL_CACHE_TTL, SEARCH_RETRIES
+    global HIST_MAX_CHARS
     global HIST_SUMMARY_ENABLE, HIST_SUMMARY_MAX_CHARS, HIST_SUMMARY_MIN_DROPPED
     global RAG_MAX_CHARS, SEARCH_MAX_CHARS, SEARCH_SNIPPET_CHARS, SEARCH_TITLE_CHARS
     global USER_MAX_CHARS, QUERY_REWRITE_LLM
@@ -225,6 +251,7 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     global RERANK_ENABLE, RERANK_BACKEND, RERANK_MODEL, RERANK_LLM_MODEL
     global RERANK_SNIPPET_CHARS, RERANK_THRESHOLD, RERANK_BATCH
     global RERANK_QUERY_MAX_CHARS, RERANK_DOC_MAX_CHARS
+    global RERANK_SHORTCUT, RERANK_SHORTCUT_MIN, RERANK_SHORTCUT_GAP
     before = dict(globals())
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", _DEF_OLLAMA_MODEL)
     OLLAMA_TIMEOUT = _float_env("OLLAMA_TIMEOUT", _DEF_OLLAMA_TIMEOUT)
@@ -232,15 +259,16 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     MAX_TOOL_ROUNDS = _int_env("MAX_TOOL_ROUNDS", _DEF_MAX_TOOL_ROUNDS)
     SEARCH_QUERY_MAX_CHARS = _int_env("SEARCH_QUERY_MAX_CHARS", _DEF_SEARCH_QUERY_MAX_CHARS)
     SEARCH_TIMEOUT = _float_env("SEARCH_TIMEOUT", _DEF_SEARCH_TIMEOUT)
-    SEARCH_REGION = os.getenv("SEARCH_REGION", _DEF_SEARCH_REGION).strip()
+    SEARCH_REGION = os.getenv("SEARCH_REGION", "").strip() or _DEF_SEARCH_REGION
     RAG_MAX_RESULTS = _int_env("RAG_MAX_RESULTS", _DEF_RAG_MAX_RESULTS)
-    RAG_ENABLE = os.getenv("RAG_ENABLE", _DEF_ENABLED) != "0"
+    RAG_ENABLE = _bool_env("RAG_ENABLE", True)
     OLLAMA_RETRIES = _int_env("OLLAMA_RETRIES", _DEF_OLLAMA_RETRIES)
     SEARCH_CACHE_MAX = _int_env("SEARCH_CACHE_MAX", _DEF_SEARCH_CACHE_MAX)
     SEARCH_CACHE_TTL = _float_env("SEARCH_CACHE_TTL", _DEF_SEARCH_CACHE_TTL)
     SEARCH_FAIL_CACHE_TTL = _float_env("SEARCH_FAIL_CACHE_TTL", _DEF_SEARCH_FAIL_CACHE_TTL)
+    SEARCH_RETRIES = _int_env("SEARCH_RETRIES", _DEF_SEARCH_RETRIES)
     HIST_MAX_CHARS = _int_env("HIST_MAX_CHARS", _DEF_HIST_MAX_CHARS)
-    HIST_SUMMARY_ENABLE = os.getenv("HIST_SUMMARY_ENABLE", _DEF_DISABLED) == "1"
+    HIST_SUMMARY_ENABLE = _bool_env("HIST_SUMMARY_ENABLE", False)
     HIST_SUMMARY_MAX_CHARS = _int_env("HIST_SUMMARY_MAX_CHARS", _DEF_HIST_SUMMARY_MAX_CHARS)
     HIST_SUMMARY_MIN_DROPPED = _int_env("HIST_SUMMARY_MIN_DROPPED", _DEF_HIST_SUMMARY_MIN_DROPPED)
     RAG_MAX_CHARS = _int_env("RAG_MAX_CHARS", _DEF_RAG_MAX_CHARS)
@@ -248,7 +276,7 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     SEARCH_SNIPPET_CHARS = _int_env("SEARCH_SNIPPET_CHARS", _DEF_SEARCH_SNIPPET_CHARS)
     SEARCH_TITLE_CHARS = _int_env("SEARCH_TITLE_CHARS", _DEF_SEARCH_TITLE_CHARS)
     USER_MAX_CHARS = _int_env("USER_MAX_CHARS", _DEF_USER_MAX_CHARS)
-    QUERY_REWRITE_LLM = os.getenv("QUERY_REWRITE_LLM", _DEF_DISABLED) == "1"
+    QUERY_REWRITE_LLM = _bool_env("QUERY_REWRITE_LLM", False)
     WORKSPACE_DIRNAME = os.getenv("WORKSPACE_DIRNAME", _DEF_WORKSPACE_DIRNAME).strip() or _DEF_WORKSPACE_DIRNAME
     WORKSPACE_MAX_FILE_CHARS = _int_env("WORKSPACE_MAX_FILE_CHARS", _DEF_WORKSPACE_MAX_FILE_CHARS)
     WORKSPACE_PATH_MAX_CHARS = _int_env("WORKSPACE_PATH_MAX_CHARS", _DEF_WORKSPACE_PATH_MAX_CHARS)
@@ -272,16 +300,20 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     INGEST_CSV_MAX_ROWS = _int_env("INGEST_CSV_MAX_ROWS", _DEF_INGEST_CSV_MAX_ROWS)
     INGEST_TEXT_MAX_CHARS = _int_env("INGEST_TEXT_MAX_CHARS", _DEF_INGEST_TEXT_MAX_CHARS)
     INGEST_DOCX_MAX_PARAS = _int_env("INGEST_DOCX_MAX_PARAS", _DEF_INGEST_DOCX_MAX_PARAS)
-    RERANK_ENABLE = os.getenv("RERANK_ENABLE", _DEF_ENABLED) != "0"
+    RERANK_ENABLE = _bool_env("RERANK_ENABLE", True)
     RERANK_BACKEND = os.getenv("RERANK_BACKEND", _DEF_RERANK_BACKEND).strip().lower()
     RERANK_MODEL = os.getenv("RERANK_MODEL", _DEF_RERANK_MODEL)
-    RERANK_LLM_MODEL = os.getenv("RERANK_LLM_MODEL", OLLAMA_MODEL)
+    RERANK_LLM_MODEL = os.getenv("RERANK_LLM_MODEL", OLLAMA_MODEL)  # 沒指定就跟聊天模型走（OLLAMA_MODEL 已在上面先更新）
     RERANK_SNIPPET_CHARS = _int_env("RERANK_SNIPPET_CHARS", _DEF_RERANK_SNIPPET_CHARS)
     RERANK_THRESHOLD = _threshold_env("RERANK_THRESHOLD")
     RERANK_BATCH = _int_env("RERANK_BATCH", _DEF_RERANK_BATCH)
     RERANK_QUERY_MAX_CHARS = _int_env("RERANK_QUERY_MAX_CHARS", _DEF_RERANK_QUERY_MAX_CHARS)
     RERANK_DOC_MAX_CHARS = _int_env("RERANK_DOC_MAX_CHARS", _DEF_RERANK_DOC_MAX_CHARS)
+    RERANK_SHORTCUT = _bool_env("RERANK_SHORTCUT", _DEF_RERANK_SHORTCUT)
+    RERANK_SHORTCUT_MIN = _float_env("RERANK_SHORTCUT_MIN", _DEF_RERANK_SHORTCUT_MIN)
+    RERANK_SHORTCUT_GAP = _float_env("RERANK_SHORTCUT_GAP", _DEF_RERANK_SHORTCUT_GAP)
     after = dict(globals())
+    # 只收公開旋鈕的異動（_ 開頭的內部 helper 不傳，避免誤觸模組內部狀態）
     diff = {k: (before.get(k), after.get(k)) for k in after if before.get(k) != after.get(k) and not k.startswith("_")}
     # P10 傳染已載入模組的舊快照，避免改 env 還要重啟
     # P18 節流：只傳給本輪有相關異動的模組；diff 為空（無異動）時維持舊行為全傳。

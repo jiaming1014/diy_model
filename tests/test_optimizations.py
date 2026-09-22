@@ -1,9 +1,6 @@
 """優化回歸測試：P0+P1+P2 全量對應，不碰網路／Qdrant／Ollama。"""
 
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unittest import mock
 
@@ -62,6 +59,17 @@ class TestChitchatDateGuards:
     def test_weather_excludes_date(self) -> None:
         """含天氣詞不算查日期，避免天氣問題走日期捷徑。」"""
         assert _is_date_query("今天天氣如何") is False
+
+    def test_soft_keywords_need_company(self) -> None:
+        """今日／今天／現在單獨出現不算，需搭配實詞或短到只剩它。」"""
+        assert _is_date_query("現在流行什麼音樂") is False
+        assert _is_date_query("今日頭條有什麼") is False
+        assert _is_date_query("今天吃什麼") is False
+        assert _is_date_query("今天股市如何") is False
+        assert _is_date_query("今天幾號") is True
+        assert _is_date_query("現在幾點") is True
+        assert _is_date_query("今天") is True
+        assert _is_date_query("現在") is True
 
 
 class TestToolsLive:

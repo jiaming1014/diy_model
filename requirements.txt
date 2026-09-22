@@ -1,5 +1,6 @@
-# diy_model 核心依賴：聊天＋檢索＋測試可跑
+# diy_model 核心依賴：聊天＋檢索（測試要另裝 pytest，見 requirements-optional.txt）
 # 安裝：pip install -r requirements.txt
 ollama==0.6.2
 ddgs==9.16.0
-qdrant-client==1.19.0
+qdrant-client==1.19.1
+tzdata  # Windows 無系統時區庫，zoneinfo(Asia/Taipei) 必需；Linux／macOS 無影響

@@ -4,8 +4,6 @@ text_utils 抽取／rewrite 模型，不碰真網路。"""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from unittest import mock
 
 import chat_core
@@ -156,19 +154,23 @@ class TestQdrantApiKey:
         """有 api_key 建連線時帶入（Qdrant Cloud 用）。」"""
         import dataclasses
 
+        import qdrant_client
+
         import rag_qdrant as rq
 
         cfg = dataclasses.replace(rq._CONFIG, api_key="secret")
         monkeypatch.setattr(rq, "_CONFIG", cfg)
         monkeypatch.setattr(rq, "_cached_client", None)
         monkeypatch.setattr(rq, "_cached_key", None)
-        with mock.patch.object(rq, "QdrantClient") as m_cls:
+        with mock.patch.object(qdrant_client, "QdrantClient") as m_cls:
             rq._client()
         m_cls.assert_called_once_with(url=cfg.url, api_key="secret")
 
     def test_no_key_omits_param(self, monkeypatch) -> None:
-        """無 api_key 不帶參數，本地 Docker 直連。」"""
+        """無 api_key 不帶參數，本地 Docker 直連（_client 本體走函式內 import）。」"""
         import dataclasses
+
+        import qdrant_client
 
         import rag_qdrant as rq
 
@@ -176,7 +178,7 @@ class TestQdrantApiKey:
         monkeypatch.setattr(rq, "_CONFIG", cfg)
         monkeypatch.setattr(rq, "_cached_client", None)
         monkeypatch.setattr(rq, "_cached_key", None)
-        with mock.patch.object(rq, "QdrantClient") as m_cls:
+        with mock.patch.object(qdrant_client, "QdrantClient") as m_cls:
             rq._client()
         m_cls.assert_called_once_with(url=cfg.url)
 
