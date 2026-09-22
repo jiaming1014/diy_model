@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 # 設定唯一真相在 config.py，這裡保留 RAGConfig 介面（欄位名不變）
 import config as _config
+from text_utils import redact_url_creds as _redact_url  # L1：錯誤訊息／日誌的 URL 帳密遮蔽
 from ttl_cache import TTLCache  # P14：共用 LRU＋TTL 快取，查詢向量快取用
 
 logger = logging.getLogger(__name__)
@@ -483,7 +484,7 @@ def ensure_collection(dim: int) -> None:
             raise  # 自己拋的維度錯誤直接上浮，不可誤判成「不存在」去重建
         msg = str(e).lower()
         if any(k in msg for k in ("connect", "refused", "connection", "timeout", "unreachable")):
-            raise RuntimeError(f"連不上 Qdrant（{_CONFIG.url}）：{e}") from e
+            raise RuntimeError(_redact_url(f"連不上 Qdrant（{_CONFIG.url}）：{e}")) from e
         if not any(k in msg for k in ("404", "not found", "not exist", "doesn't exist", "does not exist")):
             logger.warning("查詢收藏集時發生未知錯誤（%s），嘗試建立", e)
     from qdrant_client.http.models import Distance, VectorParams  # 函式內載入，同上
@@ -1074,7 +1075,7 @@ def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
             logger.warning("重排略過（%s），使用向量順序", e)
             return hits[:limit]
     except Exception as e:
-        logger.warning("本地檢索略過（%s）", e)
+        logger.warning("本地檢索略過（%s）", _redact_url(str(e)))
         return []
 
 
@@ -1105,7 +1106,7 @@ def main() -> int:
         try:
             ingest_folder(args.ingest, on_progress=_on_progress if args.progress else None)
         except Exception as e:  # 路徑不存在、Qdrant 連不上都印友好訊息，不噴 traceback
-            print(f"匯入失敗：{e}")
+            print(f"匯入失敗：{_redact_url(str(e))}")
             return 1
     elif args.query:
         hits = search_local(args.query, limit=args.limit)

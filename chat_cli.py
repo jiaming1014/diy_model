@@ -35,6 +35,7 @@ from chat_core import OLLAMA_MODEL as _DEFAULT_MODEL
 from chat_core import ChatMessage, ChatState, chat_w, get_last_rag, get_last_sources
 from chat_core import DEFAULT_SYS_MSG  # P17：系統提示唯一真相在 chat_core
 import chat_core as _core
+from text_utils import redact_url_creds as _redact_url  # L1：輸出／日誌的 URL 帳密遮蔽
 
 sys_msg = DEFAULT_SYS_MSG  # 相容舊匯入：值與 chat_core.DEFAULT_SYS_MSG 同一內容
 MODEL = _DEFAULT_MODEL
@@ -143,6 +144,12 @@ def _save_history(state: ChatState, path: Path | None = None) -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_text(json.dumps(tail, ensure_ascii=False, indent=2), encoding="utf-8")
+            if os.name == "posix":
+                # K2：歷史含私人對話，先收權限再原子替換，避免檔案曾以 0644 存在
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
             os.replace(tmp, p)  # 原子替換，多開同時寫不留半檔
         except Exception as e:
             logging.getLogger(__name__).warning("歷史存檔失敗：%s", e)
@@ -198,7 +205,7 @@ def _run_ingest_command(cmd: str) -> None:
             on_progress=lambda done, total, rel: print(f"[{done}/{total}] {rel}", flush=True),
         )
     except Exception as e:
-        print(f"匯入失敗：{e}", flush=True)
+        print(f"匯入失敗：{_redact_url(str(e))}", flush=True)
         return
     print(f"匯入完成，共 {n} 點。", flush=True)
 
@@ -282,10 +289,10 @@ def _run_health_check(model: str) -> int:
             try:
                 collections = _f_qdrant.result()
                 names = [getattr(c, "name", str(c)) for c in getattr(collections, "collections", [])]  # mock 或新版欄位名變了也不炸
-                url = rag_qdrant.get_config().url
+                url = _redact_url(rag_qdrant.get_config().url)
                 print(f"Qdrant：可用（{url}，收藏集：{', '.join(names) if names else '無'}）", flush=True)
             except Exception as e:
-                print(f"Qdrant：不可用（{e}）", flush=True)
+                print(f"Qdrant：不可用（{_redact_url(str(e))}）", flush=True)
                 ok = False
         if _f_embed is None:
             # P22 慣例：刻意停用不算故障，印狀態但不判定失敗

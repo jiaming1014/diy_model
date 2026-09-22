@@ -13,7 +13,7 @@
 - **智慧分流**：問日期走捷徑；即時資訊直接搜網；本地可答就不打模型（P15 起單次生成）
 - **降級保證**：任何外部依賴（Ollama／Qdrant／搜尋）掛掉都有備案，不會整支炸
 - **快取**：搜尋結果＋查詢向量共用 LRU＋TTL 快取
-- **229 個測試**：全 mock、不碰網路，CI 可跑
+- **242 個測試**：全 mock、不碰網路，CI 可跑
 
 ## 系統需求
 
@@ -68,7 +68,7 @@ python eval.py --with-model llama3.2:1b
 | `get_today` | 台灣今天日期星期 | 預設、一般問答 |
 | `search_web` | 上網查即時資料 | 預設；`--no-search` 時不給 |
 | `play_youtube_music` | 開 YouTube 搜尋播歌 | 預設、音樂請求 |
-| `workspace_write_file` | 桌面工作區內新增／整檔覆寫檔案 | 預設、工作區請求 |
+| `workspace_write_file` | 桌面工作區內新增／整檔覆寫檔案（拒可執行檔，含尾點／NTFS 資料流／保留裝置名繞過寫法） | 預設、工作區請求 |
 | `workspace_make_dir` | 工作區內建資料夾（可多層） | 預設、工作區請求 |
 
 * 工作區請求、音樂請求會跳過本地筆記檢索（省一次嵌入＋Qdrant）。
@@ -122,7 +122,7 @@ python eval.py --with-model llama3.2:1b
 ## 測試與靜態檢查
 
 ```bash
-python -m pytest -q     # 229 passed，不碰真網路
+python -m pytest -q     # 242 passed、2 skipped，不碰真網路
 python -m ruff check .  # 靜態檢查（E/F）
 python -m pyright       # 型別檢查
 ```
@@ -141,7 +141,7 @@ diy_model/
 ├── config.py         # 全域設定唯一真相
 ├── eval.py           # RAG 品質評估（檢索層 MRR／模型層引用）
 ├── notes/            # 你的筆記放這裡
-└── tests/            # 229 個測試
+└── tests/            # 242 個測試
 ```
 
 ## 流程速覽

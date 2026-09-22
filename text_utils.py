@@ -178,6 +178,21 @@ _TRACKING_PARAM_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+_CRED_IN_URL_RE: Final[re.Pattern[str]] = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<userinfo>[^/@\s]+)@")
+
+
+def redact_url_creds(text: str) -> str:
+    """把文字中的 URL 帳密遮蔽成 scheme://***@host（L1）。
+
+    錯誤訊息、日誌與 --health 輸出可能夾帶 QDRANT_URL；若使用者以
+    https://user:pass@host 形式設定（Qdrant 基本驗證常見寫法），
+    原文會把密碼印出來。這裡做通用遮蔽，不需知道設定了什麼。
+    """
+    if not text:
+        return text
+    return _CRED_IN_URL_RE.sub(lambda m: f"{m.group('scheme')}***@", text)
+
+
 def _normalize_url(url: str) -> str:
     """URL 去重鍵：去 # 片段與追蹤參數＋去尾斜線；只小寫 scheme＋host（DNS 不分大小寫），path／query 保大小寫。」"""
     raw = url.strip() if isinstance(url, str) else ("" if url is None else str(url))
