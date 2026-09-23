@@ -7,6 +7,7 @@ from unittest import mock
 import ollama_shared as shared
 
 class TestOllamaModelNames:
+    """模型名單解析：dict／list／物件三形狀，看不懂回空不拋錯。"""
     def test_dict_shape(self) -> None:
         """標準 dict 回傳解析出模型名。」"""
         out = shared.ollama_model_names({"models": [{"name": "llama3.2:1b"}, {"model": "qwen3:8b"}]})
@@ -28,6 +29,7 @@ class TestOllamaModelNames:
         assert shared.ollama_model_names(None) == []
 
 class TestProbeModel:
+    """模型探測：名單有回 True、缺或連線錯誤回 False。"""
     def _client_with(self, payload: object) -> mock.Mock:
         """假 ollama client：list() 回指定形狀。」"""
         c = mock.Mock()
@@ -56,6 +58,7 @@ class TestProbeModel:
             assert shared.probe_model("   ", 300.0) is False
 
 class TestBoolEnv:
+    """布林環境變數解析：多種寫法真值表，未設或壞值回預設。"""
     def test_truth_table(self, monkeypatch) -> None:
         """布林真值表：多種寫法正反都認，不分大小寫。」"""
         import config as c

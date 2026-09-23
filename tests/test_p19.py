@@ -16,6 +16,7 @@ import chat_core
 # 1. 意圖偵測
 # ------------------------------------------------------------
 class TestDetectIntent:
+    """意圖偵測：music／workspace／一般回 None。"""
     def test_music(self) -> None:
         """播歌請求判為 music。」"""
         assert chat_core._detect_intent("幫我在 YouTube 播周杰倫的歌") == "music"
@@ -36,6 +37,7 @@ class TestDetectIntent:
 # 2. 工具子集
 # ------------------------------------------------------------
 class TestToolSubsets:
+    """工具子集：依意圖與搜尋開關給不同工具清單。"""
     def test_default_has_all_five(self) -> None:
         """無參數呼叫維持 5 個工具（含搜尋）。」"""
         names = {t["function"]["name"] for t in chat_core._tools()}  # type: ignore[index]
@@ -63,6 +65,7 @@ class TestToolSubsets:
 # 3. 工作區沙盒（根目錄 mock 到 tmp_path）
 # ------------------------------------------------------------
 class TestWorkspaceSandbox:
+    """工作區沙盒：穿越與絕對路徑擋下，正常相對路徑可寫可建。"""
     def test_traversal_blocked(self, tmp_path: Path) -> None:
         """../ 穿越擋下，不寫檔。」"""
         with mock.patch.object(chat_core, "_workspace_root", return_value=tmp_path):
@@ -92,6 +95,7 @@ class TestWorkspaceSandbox:
 # 4. 意圖連動：RAG 跳過＋工具子集進提示
 # ------------------------------------------------------------
 class TestIntentFlow:
+    """意圖連動：寫檔請求跳過 RAG，且只給工作區工具子集。"""
     def test_workspace_skips_rag(self) -> None:
         """寫檔請求不查 RAG（省一次嵌入＋Qdrant）。」"""
         st = chat_core.ChatState()
@@ -107,6 +111,7 @@ class TestIntentFlow:
         seen: dict = {}
 
         def fake_stream(messages, model, tools=None, calls_out=None):
+            """假串流：記下工具清單供斷言，回空片段。"""
             seen["tools"] = tools
             return iter([])
 
@@ -123,12 +128,14 @@ class TestIntentFlow:
 # 5. --no-search 拆分：只關上網，本機工具保留
 # ------------------------------------------------------------
 class TestWebSearchSplit:
+    """--no-search 拆分：只關上網搜尋，本機工具保留且不預補搜。"""
     def test_no_web_search_skips_presearch(self) -> None:
         """web_search=False 不預補搜，工具清單無 search_web。」"""
         st = chat_core.ChatState()
         seen: dict = {}
 
         def fake_stream(messages, model, tools=None, calls_out=None):
+            """假串流：記下工具清單供斷言，回空片段。"""
             seen["tools"] = tools
             return iter([])
 
@@ -146,6 +153,7 @@ class TestWebSearchSplit:
 # 6. YouTube 無瀏覽器降級
 # ------------------------------------------------------------
 class TestYoutubeFallback:
+    """YouTube 降級：開不了瀏覽器給手動連結，不謊報成功。"""
     def test_browser_no_response(self) -> None:
         """webbrowser.open 回 False 給手動連結，不謊報成功。」"""
         with mock.patch("webbrowser.open", return_value=False):
@@ -164,6 +172,7 @@ class TestYoutubeFallback:
 # 7. P20：可執行檔防護＋匯入提示＋YT 上限＋health 工作區
 # ------------------------------------------------------------
 class TestP20Hardening:
+    """P20 硬化：可執行檔防護、匯入提示、YT 上限、health 報工作區。"""
     def test_blocked_ext(self, tmp_path: Path) -> None:
         """exe 擋下且不落地。」"""
         with mock.patch.object(chat_core, "_workspace_root", return_value=tmp_path):
@@ -218,6 +227,7 @@ class TestP20Hardening:
 # 5. 工作區路徑邊界：磁碟機前綴與歷史路徑回退
 # ------------------------------------------------------------
 class TestWorkspacePathEdge:
+    """工作區路徑邊界：磁碟機前綴擋下、歷史檔路徑回退與 ~ 展開。"""
     def test_drive_letter_blocked(self, tmp_path: Path) -> None:
         """C:foo 磁碟機相對路徑擋下（只在 Windows 有意義）。」"""
         import os

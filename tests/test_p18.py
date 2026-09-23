@@ -11,6 +11,7 @@ from ttl_cache import TTLCache
 
 
 class TestRefreshFanout:
+    """refresh 扇出節流：無相關異動的模組跳過同步。"""
     def test_unrelated_modules_skipped(self, monkeypatch) -> None:
         """只改搜尋區：rag／重排無相關異動，跳過同步。」"""
         import config as c
@@ -47,6 +48,7 @@ class TestRefreshFanout:
 
 
 class TestFailCache:
+    """搜尋失敗空結果短快取：壞查詢短時間內不再打網路。"""
     def test_failed_search_cached_short(self) -> None:
         """兩次全失敗才回空，第二次命中失敗短快取不再打網路。」"""
         chat_core._SEARCH_CACHE.clear()
@@ -61,6 +63,7 @@ class TestFailCache:
 
 
 class TestCacheStats:
+    """快取統計：計數正確、單筆 TTL 覆寫、清空歸零。"""
     def test_stats_counts(self) -> None:
         """命中統計計數：命中／未中／寫入／淘汰各記一次。」"""
         c: TTLCache[int] = TTLCache(maxsize=2, ttl=10.0)
@@ -96,6 +99,7 @@ class TestCacheStats:
 
 
 class TestEmptySuccessShortTTL:
+    """成功但 0 筆與失敗同視，用短 TTL 避免舊「無結果」殘留。"""
     def test_empty_success_uses_short_ttl(self) -> None:
         """成功但 0 筆與失敗同視，短快取避免舊無結果殘留。」"""
         chat_core._SEARCH_CACHE.clear()
@@ -112,6 +116,7 @@ class TestEmptySuccessShortTTL:
 
 
 class TestCacheStatsLogged:
+    """命中與寫入各記一條 debug 日誌，數字與 stats() 同源。"""
     def test_hit_and_store_logged(self, caplog) -> None:  # type: ignore[no-untyped-def]
         """命中與寫入各記一條 debug，數字與 stats() 同源。」"""
         chat_core._SEARCH_CACHE.clear()

@@ -8,6 +8,7 @@ import chat_core
 
 
 class TestDualBudget:
+    """雙預算：token 尺有效，字數＋token 任一超標即裁。"""
     def test_tokens_fallback_len(self) -> None:
         """token 計算有正值：缺 tiktoken 退化字數也不回 0。」"""
         n = chat_core._content_tokens("hello")
@@ -25,6 +26,7 @@ class TestDualBudget:
 
 
 class TestEvalDual:
+    """eval 雙指標：引用標註偵測與模型層「有依據需引用」判定。"""
     def test_citation_detect(self) -> None:
         """引用標註偵測：[來源i]／[筆記i] 算有引用，其餘不算。」"""
         from eval import _has_citation
@@ -46,6 +48,7 @@ class TestEvalDual:
 
 
 class TestStreamRetry:
+    """串流建立失敗重試：第一次炸、第二次成功即回內容。"""
     def test_retry_succeeds(self) -> None:
         """串流建立失敗重試一次：第一次炸、第二次串流成功即回內容。」"""
         good = iter([{"message": {"content": "hi"}}])

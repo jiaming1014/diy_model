@@ -7,6 +7,7 @@ from unittest import mock
 
 
 class TestDocxLimit:
+    """DOCX 段落上限：超限截斷並註記，避免大檔撐爆記憶體。"""
     def test_truncates_paras(self) -> None:
         """DOCX 超段落上限截斷並註記，避免大檔撐爆記憶體。」"""
         import dataclasses
@@ -25,6 +26,7 @@ class TestDocxLimit:
 
 
 class TestPerFileOk:
+    """逐檔 ok 判定：嵌入全失敗的檔不標 ok，下次匯入重試補寫。"""
     def test_failed_file_not_marked_ok(self, tmp_path: Path) -> None:
         """嵌入全失敗的檔不標 ok，下次匯入會重試補寫。」"""
         import rag_qdrant as rq
@@ -55,6 +57,7 @@ class TestPerFileOk:
 
 
 class TestSearchRetry:
+    """搜尋重試：首炸次成功回結果，DDGS 共呼叫 2 次。"""
     def test_retry_succeeds_second(self) -> None:
         """搜尋失敗重試一次：首炸次成功，回 1 筆且 DDGS 共呼叫 2 次。」"""
         import chat_core
@@ -71,6 +74,7 @@ class TestSearchRetry:
 
 
 class TestCrossModuleSync:
+    """跨模組同步：config.refresh 把異動傳染三模組快照，免重啟生效。"""
     def test_refresh_propagates(self, monkeypatch) -> None:
         """config.refresh 把異動傳染三模組快照，免重啟生效。」"""
         import config as c

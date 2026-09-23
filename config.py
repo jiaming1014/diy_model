@@ -195,6 +195,30 @@ RERANK_SHORTCUT_MIN: float = _float_env("RERANK_SHORTCUT_MIN", _DEF_RERANK_SHORT
 RERANK_SHORTCUT_GAP: float = _float_env("RERANK_SHORTCUT_GAP", _DEF_RERANK_SHORTCUT_GAP)  # C2：領先差距
 
 
+# --- OPT-3：公開旋鈕鍵清單，refresh diff 只比對這些，避免誤觸模組／函式等內部全域 ---
+_PUBLIC_KEYS: frozenset[str] = frozenset({
+    "OLLAMA_MODEL", "OLLAMA_TIMEOUT", "SEARCH_MAX_RESULTS", "MAX_TOOL_ROUNDS",
+    "SEARCH_QUERY_MAX_CHARS", "SEARCH_TIMEOUT", "SEARCH_REGION", "RAG_MAX_RESULTS",
+    "RAG_ENABLE", "OLLAMA_RETRIES", "SEARCH_CACHE_MAX", "SEARCH_CACHE_TTL",
+    "SEARCH_FAIL_CACHE_TTL", "SEARCH_RETRIES", "HIST_MAX_CHARS",
+    "HIST_SUMMARY_ENABLE", "HIST_SUMMARY_MAX_CHARS", "HIST_SUMMARY_MIN_DROPPED",
+    "RAG_MAX_CHARS", "SEARCH_MAX_CHARS", "SEARCH_SNIPPET_CHARS", "SEARCH_TITLE_CHARS",
+    "USER_MAX_CHARS", "QUERY_REWRITE_LLM",
+    "WORKSPACE_DIRNAME", "WORKSPACE_MAX_FILE_CHARS", "WORKSPACE_PATH_MAX_CHARS",
+    "YOUTUBE_QUERY_MAX_CHARS",
+    "QDRANT_URL", "QDRANT_COLLECTION", "QDRANT_API_KEY", "EMBED_MODEL", "VISION_MODEL",
+    "CHUNK_CHARS", "CHUNK_OVERLAP", "RERANK_RECALL", "EMBED_BATCH",
+    "UPSERT_BATCH", "CHUNK_MAX_TOKENS", "QUERY_VEC_CACHE_MAX", "QUERY_VEC_CACHE_TTL",
+    "RAG_QUERY_MAX_CHARS",
+    "INGEST_IMAGE_MAX_MB", "INGEST_PDF_MAX_PAGES", "INGEST_CSV_MAX_ROWS",
+    "INGEST_TEXT_MAX_CHARS", "INGEST_DOCX_MAX_PARAS",
+    "RERANK_ENABLE", "RERANK_BACKEND", "RERANK_MODEL", "RERANK_LLM_MODEL",
+    "RERANK_SNIPPET_CHARS", "RERANK_THRESHOLD", "RERANK_BATCH",
+    "RERANK_QUERY_MAX_CHARS", "RERANK_DOC_MAX_CHARS",
+    "RERANK_SHORTCUT", "RERANK_SHORTCUT_MIN", "RERANK_SHORTCUT_GAP",
+})
+
+
 # --- P18 節流：refresh 扇出對照表，某模組無相關異動時跳過其 _sync_config。
 # 保守原則：拿不準就放進集合，多同步一次只花幾微秒，漏同步會拿舊設定。
 _SYNC_WATCH: dict[str, frozenset[str]] = {
@@ -252,7 +276,9 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     global RERANK_SNIPPET_CHARS, RERANK_THRESHOLD, RERANK_BATCH
     global RERANK_QUERY_MAX_CHARS, RERANK_DOC_MAX_CHARS
     global RERANK_SHORTCUT, RERANK_SHORTCUT_MIN, RERANK_SHORTCUT_GAP
-    before = dict(globals())
+    # OPT-18：只快照公開旋鈕，不再 dict(globals()) 全量拷貝模組／函式
+    _g = globals()
+    before = {k: _g.get(k) for k in _PUBLIC_KEYS}
     OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", _DEF_OLLAMA_MODEL)
     OLLAMA_TIMEOUT = _float_env("OLLAMA_TIMEOUT", _DEF_OLLAMA_TIMEOUT)
     SEARCH_MAX_RESULTS = _int_env("SEARCH_MAX_RESULTS", _DEF_SEARCH_MAX_RESULTS)
@@ -312,9 +338,10 @@ def refresh() -> dict[str, tuple[Any, Any]]:
     RERANK_SHORTCUT = _bool_env("RERANK_SHORTCUT", _DEF_RERANK_SHORTCUT)
     RERANK_SHORTCUT_MIN = _float_env("RERANK_SHORTCUT_MIN", _DEF_RERANK_SHORTCUT_MIN)
     RERANK_SHORTCUT_GAP = _float_env("RERANK_SHORTCUT_GAP", _DEF_RERANK_SHORTCUT_GAP)
-    after = dict(globals())
-    # 只收公開旋鈕的異動（_ 開頭的內部 helper 不傳，避免誤觸模組內部狀態）
-    diff = {k: (before.get(k), after.get(k)) for k in after if before.get(k) != after.get(k) and not k.startswith("_")}
+    _g2 = globals()
+    after = {k: _g2.get(k) for k in _PUBLIC_KEYS}
+    # OPT-3：只收公開旋鈕的異動（_ 開頭的內部 helper 與模組／函式不傳，避免誤觸模組內部狀態）
+    diff = {k: (before.get(k), after.get(k)) for k in _PUBLIC_KEYS if before.get(k) != after.get(k)}
     # P10 傳染已載入模組的舊快照，避免改 env 還要重啟
     # P18 節流：只傳給本輪有相關異動的模組；diff 為空（無異動）時維持舊行為全傳。
     try:

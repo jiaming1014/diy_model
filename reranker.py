@@ -47,6 +47,11 @@ logger = logging.getLogger(__name__)
 # 上限 4：預設取 3 完全夠用；本機小模型逐筆極慢，8 連打實測 300 秒做不完
 _LLM_PERDOC_MAX: int = 4  # 超過此數的文件，超出部分直接記 0 分，不再逐筆打模型
 _LLM_PERDOC_WORKERS: int = 4  # 逐筆備援並行數
+# OPT-13：LLM 分數數字正則預編譯，整批＋逐筆解析不再現編譯
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+# OPT-21：無窮哨兵常數化，熱路徑不再現建 float("inf")／float("-inf")
+_INF: float = float("inf")
+_NINF: float = float("-inf")
 
 
 def _sync_config() -> None:
@@ -107,27 +112,37 @@ def _get_ollama():
 
 
 def _clamp_score(x: object) -> float:
-    """把 LLM 分數夾到 0~10，避免模型亂給 100 分。」"""
-    try:
-        v = float(str(x).strip())
-    except (TypeError, ValueError, AttributeError):
-        return 0.0
+    """把 LLM 分數夾到 0~10，避免模型亂給 100 分。
+
+    OPT-15：數字快徑先行，float／int／bool 不繞字串，字串沿舊路 strip 後轉換。
+    """
+    if isinstance(x, bool):
+        return 0.0  # 沿舊語意：str(True) 轉 float 恆失敗歸零，避免快徑改變行為
+    elif isinstance(x, (int, float)):
+        v = float(x)
+        if v != v or v in (_INF, _NINF):
+            return 0.0
+    else:
+        try:
+            v = float(str(x).strip())
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
     return min(10.0, max(0.0, v))
 
 
 def _apply_threshold(docs: list[dict[str, str]]) -> list[dict[str, str]]:
     """低分過濾：沒設門檻直接回傳，有設就丟掉低分（至少留 1 條避免全空）。"""
     try:
-        if RERANK_THRESHOLD == float("-inf"):
+        if RERANK_THRESHOLD == _NINF:
             return docs
     except Exception:  # BROAD_EXCEPT_OK - 分數缺失時不擋路
         return docs
     kept = []
     for d in docs:
         try:
-            score = float(d.get("score", float("inf")))
+            score = float(d.get("score", _INF))
         except (TypeError, ValueError):
-            score = float("inf")  # 缺分數或壞分數當保留，避免誤殺
+            score = _INF  # 缺分數或壞分數當保留，避免誤殺
         if score >= RERANK_THRESHOLD:
             kept.append(d)
     return kept if kept else docs[:1]
@@ -217,11 +232,13 @@ def _rerank_cross(query: str, docs: list[dict[str, str]], top_k: int) -> list[di
     if model is None:
         return None
     try:
+        # OPT-9：入口快取 batch 與截斷上限，批次迴圈不再重讀全域
         batch = max(1, int(RERANK_BATCH or 8))
+        doc_chars = max(1, int(RERANK_DOC_MAX_CHARS or 2000))
         scores: list[float] = []
         for i in range(0, len(docs), batch):
             # 註：按字元截斷是省記憶體的近似，中文大致 1 字 ~ 1-2 token
-            pairs = [[query, str(d.get("text", "") or "")[:RERANK_DOC_MAX_CHARS]] for d in docs[i:i + batch]]
+            pairs = [[query, str(d.get("text", "") or "")[:doc_chars]] for d in docs[i:i + batch]]
             try:
                 part = model.predict(pairs, show_progress_bar=False)  # 進度條關掉，CLI 不洗版（失敗照樣走備援）
             except Exception as e:
@@ -279,7 +296,7 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
                 return scores
     except Exception:
         pass
-    nums = [_clamp_score(x) for x in re.findall(r"\d+(?:\.\d+)?", text)]
+    nums = [_clamp_score(x) for x in _NUM_RE.findall(text)]
     if len(nums) == len(docs):
         # 個數吻合即收：裸分數串（無括號）也認，省掉逐筆備援的 N 次呼叫；巧合撞數機率極低
         return nums[:len(docs)]
@@ -300,7 +317,7 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
             )
             s_raw = single["message"] if isinstance(single, dict) else getattr(single, "message", None)
             s_text = str(s_raw.get("content") if isinstance(s_raw, dict) else getattr(s_raw, "content", "") or "")
-            m = re.search(r"\d+(?:\.\d+)?", s_text)
+            m = _NUM_RE.search(s_text)
             return idx, (_clamp_score(m.group(0)) if m else 0.0)
         except Exception as e:
             logger.warning("LLM 逐筆打分失敗，已記 0 分：%s", e)

@@ -15,6 +15,7 @@ import rag_qdrant
 # 1. search_local limit 護欄
 # ------------------------------------------------------------
 class TestSearchLocalLimit:
+    """search_local limit 護欄：0 與負數直接回空，不碰 Qdrant。"""
     def test_zero_returns_empty_without_io(self) -> None:
         """limit=0 直接回空，連 Qdrant 都不碰。」"""
         with mock.patch.object(rag_qdrant, "_client") as m_client:
@@ -32,6 +33,7 @@ class TestSearchLocalLimit:
 # 2. 搜尋硬擋
 # ------------------------------------------------------------
 class TestSearchHardBlock:
+    """搜尋硬擋：關閉時幻覺呼叫也擋下，預設照常搜尋。"""
     def test_blocked_when_disabled(self) -> None:
         """開關關閉時幻覺呼叫也擋下。」"""
         out = chat_core._run_tool(
@@ -53,6 +55,7 @@ class TestSearchHardBlock:
 # 3. 查詢截斷收斂
 # ------------------------------------------------------------
 class TestRagQueryTruncation:
+    """檢索查詢截斷收斂：吃 _CONFIG，不寫死 500。"""
     def test_truncation_uses_config(self) -> None:
         """截斷字數吃 _CONFIG，不再寫死 500。」"""
         import dataclasses
@@ -61,6 +64,7 @@ class TestRagQueryTruncation:
         seen: dict = {}
 
         def fake_embed(q: str):
+            """假嵌入：記下收到的查詢並回 None，讓檢索提早結束。"""
             seen["q"] = q
             return None  # 回 None → search_local 提早回空
 
@@ -75,6 +79,7 @@ class TestRagQueryTruncation:
 # 4. refresh 同步：P19/P20 新鍵全覆蓋
 # ------------------------------------------------------------
 class TestRefreshSyncNewKeys:
+    """refresh 同步：P19/P20 新鍵改 env 後帶進各模組快照。"""
     def test_new_keys_propagate(self, monkeypatch) -> None:
         """新設定改 env → refresh → 各模組快照同步，最後還原。」"""
         import config as c
@@ -99,6 +104,7 @@ class TestRefreshSyncNewKeys:
 # 5. P21：重排截斷同步＋/ingest 指令
 # ------------------------------------------------------------
 class TestRerankTruncSync:
+    """重排截斷同步：改 env 後 reranker 快照同步，預設值為 500／2000。"""
     def test_new_keys_propagate(self, monkeypatch) -> None:
         """改 env → refresh → reranker 快照同步，最後還原。」"""
         import config as c
@@ -124,6 +130,7 @@ class TestRerankTruncSync:
 
 
 class TestIngestCommand:
+    """/ingest 指令解析與執行：無參數用工作區根、有參數用參數、成功／失敗。"""
     def test_parse_default_workspace(self, tmp_path: Path) -> None:
         """無參數用工作區根。」"""
         import chat_cli
@@ -170,6 +177,7 @@ class TestIngestCommand:
 # 6. P21：匯入快取原子寫入
 # ------------------------------------------------------------
 class TestIngestCacheAtomic:
+    """匯入快取原子寫入：不留 .tmp 半檔，讀回一致。"""
     def test_no_tmp_leftover(self, tmp_path: Path) -> None:
         """存檔不留 tmp 半檔，讀回一致。」"""
         cache = {"a.md": {"mtime": 1.0, "size": 2, "ok": True}}
@@ -183,6 +191,7 @@ class TestIngestCacheAtomic:
 # 7. P21：匯入缺目錄不再謊報成功
 # ------------------------------------------------------------
 class TestIngestMissingDir:
+    """匯入缺目錄：拋錯不謊報成功，對話內印失敗不中斷。"""
     def test_missing_dir_raises(self, tmp_path: Path) -> None:
         """不存在的目錄拋 FileNotFoundError，不回 0。」"""
         with pytest.raises(FileNotFoundError):
@@ -200,6 +209,7 @@ class TestIngestMissingDir:
 # 8. P21：意圖命中不預搜＋關鍵字衝突給完整清單
 # ------------------------------------------------------------
 class TestIntentPreSearch:
+    """意圖命中不預搜；關鍵字衝突時回 None 給完整工具清單。"""
     def test_music_skips_pre_search(self) -> None:
         """播歌請求不再多打一次無用搜尋。」"""
         st = chat_core.ChatState()
@@ -240,6 +250,7 @@ class TestIntentPreSearch:
 # 9. P22：意圖關鍵字漏判修正＋過寬詞收緊
 # ------------------------------------------------------------
 class TestIntentKeywordTuning:
+    """意圖關鍵字調校：補抓口語動詞／名詞，收緊過寬詞。"""
     def test_music_verb_noun_caught(self) -> None:
         """口語「播周杰倫的歌」補抓為 music。」"""
         assert chat_core._detect_intent("幫我播周杰倫的歌") == "music"
@@ -265,6 +276,7 @@ class TestIntentKeywordTuning:
 # 10. P22：重排探測尊重開關＋健康檢查不誤判
 # ------------------------------------------------------------
 class TestRerankProbeSwitch:
+    """重排探測尊重開關：停用或指定後端時不誤報可用，health 不誤判。"""
     def test_probe_disabled_returns_false(self, monkeypatch) -> None:
         """RERANK_BACKEND=none 時探測回雙 False，不誤報可用。」"""
         import reranker as r
@@ -303,6 +315,7 @@ class TestRerankProbeSwitch:
 # 11. 窄語境動作限定：遊戲／聽說只認動作，不認單純提及
 # ------------------------------------------------------------
 class TestWorkspaceNarrow:
+    """窄語境動作限定：只認動作，不認單純提及（遊戲／聽說）。"""
     def test_game_bare_mention_not_workspace(self) -> None:
         """「遊戲工作區在哪」是打聽位置，走一般問答。」"""
         assert chat_core._detect_intent("遊戲工作區在哪") is None

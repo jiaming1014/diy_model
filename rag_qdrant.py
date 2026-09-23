@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import argparse
 import csv
 import hashlib
+import io
 import json
 import logging
 import re
@@ -46,6 +47,9 @@ from text_utils import redact_url_creds as _redact_url  # L1：錯誤訊息／�
 from ttl_cache import TTLCache  # P14：共用 LRU＋TTL 快取，查詢向量快取用
 
 logger = logging.getLogger(__name__)
+
+# OPT-6：查詢鍵正規化用空白正則預編譯，熱路徑不再每次現編譯
+_WS_RE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
@@ -201,7 +205,7 @@ _QUERY_VEC_CACHE: TTLCache[list[float]] = TTLCache(
 def _normalize_query_key(query: str) -> str:
     """查詢向量快取鍵正規化：壓空白＋去頭尾，大小寫不同視為同鍵，省重複嵌入。」"""
     text = query if isinstance(query, str) else ("" if query is None else str(query))
-    norm = re.sub(r"\s+", " ", text.strip()).strip()
+    norm = _WS_RE.sub(" ", text.strip()).strip()
     return norm.lower() or norm
 
 
@@ -302,6 +306,8 @@ def _over_budget(buf: str, chunk_chars: int, chunk_tokens: int) -> bool:
 
 # 句尾標點後斷句（lookbehind 只斷不斷字）；沒標點的長串後面走字元硬切
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;…])\s*")
+# OPT-14：重疊尾巴句讀搜尋預編譯，切塊每塊不再現編譯
+_OVERLAP_PUNCT_RE = re.compile(r"[。！？!?；;\n]")
 
 
 def _split_sentences(para: str) -> list[str]:
@@ -317,7 +323,7 @@ def _overlap_tail(buf: str, ov: int) -> str:
     if len(buf) <= ov:
         return buf
     tail = buf[-ov:]
-    m = re.search(r"[。！？!?；;\n]", tail)
+    m = _OVERLAP_PUNCT_RE.search(tail)
     if m:
         aligned = tail[m.end():].lstrip()
         # 對齊後太短則保留原尾巴，避免重疊失效
@@ -571,6 +577,24 @@ def _read_csv(fp: Path) -> str:
     """
     max_rows = max(1, int(_CONFIG.csv_max_rows or 5000))
 
+    def _parse_text(text: str) -> tuple[list[list[str]], bool]:
+        """解析已解碼文字：嗅探分隔符＋邊讀邊數，超上限即停。」"""
+        try:
+            sample = text[:4096]
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
+        except Exception:
+            dialect = csv.excel
+        reader = csv.reader(io.StringIO(text), dialect)
+        out: list[list[str]] = []
+        cut = False
+        for r in reader:
+            if any(c.strip() for c in r):
+                out.append([c.strip() for c in r])
+                if len(out) > max_rows + 1:
+                    cut = True
+                    break
+        return out, cut
+
     def _parse_with_encoding(enc: str) -> tuple[list[list[str]], bool]:
         """用指定編碼解析，嚴格解碼，遇到解碼錯誤直接拋出換下一個編碼。」"""
         with fp.open("r", encoding=enc, errors="strict", newline="") as f:
@@ -595,17 +619,41 @@ def _read_csv(fp: Path) -> str:
     rows: list[list[str]] = []
     truncated = False
     last_err: Exception | None = None
-    for enc in ("utf-8-sig", "cp950", "big5"):
+    # OPT-7：小檔（<=5MB）一次讀 bytes 再試多編碼，省掉逐編碼重開檔＋重 sniff；大檔沿舊路邊讀邊數
+    try:
+        _csv_size = fp.stat().st_size
+    except Exception:
+        _csv_size = 0
+    if 0 < _csv_size <= 5 * 1024 * 1024:
         try:
-            rows, truncated = _parse_with_encoding(enc)
-            if enc != "utf-8-sig":
-                logger.info("%s 以 %s 解碼", fp.name, enc)
-            break
-        except (UnicodeDecodeError, UnicodeError, ValueError) as e:
-            last_err = e
-            continue
+            _raw = fp.read_bytes()
+        except Exception:
+            _raw = b""
+        for enc in ("utf-8-sig", "cp950", "big5"):
+            try:
+                _text = _raw.decode(enc, errors="strict")
+                rows, truncated = _parse_text(_text)
+                if enc != "utf-8-sig":
+                    logger.info("%s 以 %s 解碼", fp.name, enc)
+                break
+            except (UnicodeDecodeError, UnicodeError, ValueError) as e:
+                last_err = e
+                continue
+        else:
+            logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
+            rows, truncated = _parse_text(_raw.decode("utf-8-sig", errors="ignore"))
     else:
-        logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
+        for enc in ("utf-8-sig", "cp950", "big5"):
+            try:
+                rows, truncated = _parse_with_encoding(enc)
+                if enc != "utf-8-sig":
+                    logger.info("%s 以 %s 解碼", fp.name, enc)
+                break
+            except (UnicodeDecodeError, UnicodeError, ValueError) as e:
+                last_err = e
+                continue
+        else:
+            logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
         with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
             try:
                 sample = f.read(4096)
@@ -700,21 +748,45 @@ def _read_file_text(fp: Path) -> str:
     suffix = fp.suffix.lower()
     if suffix in {".txt", ".md"}:
         max_chars = max(1000, int(_CONFIG.text_max_chars or 200000))
-        # P15：只讀到上限＋1 字就停，超大純文字檔不再整檔載入記憶體
+        # OPT-5：小檔一次讀 bytes 進記憶體再試多編碼，省掉逐編碼重開檔的 IO；
+        # 大檔（>5MB）沿用舊路徑逐編碼讀前綴，避免一次載入記憶體。
         # 編碼相容：utf-8 嚴格先試，台灣記事本常見 cp950／big5 接著試，都失敗才退回忽略錯誤
-        text = ""
-        for enc in ("utf-8", "utf-8-sig", "cp950", "big5"):
+        try:
+            _size = fp.stat().st_size
+        except Exception:
+            _size = 0
+        if 0 < _size <= 5 * 1024 * 1024:
             try:
-                with fp.open("r", encoding=enc, errors="strict") as f:
-                    text = f.read(max_chars + 1)
-                if enc not in ("utf-8", "utf-8-sig"):
-                    logger.info("%s 以 %s 解碼", fp.name, enc)
-                break
-            except (UnicodeDecodeError, UnicodeError, ValueError):
-                continue
+                _raw = fp.read_bytes()
+            except Exception:
+                _raw = b""
+            text = ""
+            for enc in ("utf-8", "utf-8-sig", "cp950", "big5"):
+                try:
+                    text = _raw.decode(enc, errors="strict")
+                    if enc not in ("utf-8", "utf-8-sig"):
+                        logger.info("%s 以 %s 解碼", fp.name, enc)
+                    break
+                except (UnicodeDecodeError, UnicodeError, ValueError):
+                    continue
+            else:
+                text = _raw.decode("utf-8", errors="ignore")
+            text = text[: max_chars + 1]
         else:
-            with fp.open("r", encoding="utf-8", errors="ignore") as f:
-                text = f.read(max_chars + 1)
+            # P15：只讀到上限＋1 字就停，超大純文字檔不再整檔載入記憶體
+            text = ""
+            for enc in ("utf-8", "utf-8-sig", "cp950", "big5"):
+                try:
+                    with fp.open("r", encoding=enc, errors="strict") as f:
+                        text = f.read(max_chars + 1)
+                    if enc not in ("utf-8", "utf-8-sig"):
+                        logger.info("%s 以 %s 解碼", fp.name, enc)
+                    break
+                except (UnicodeDecodeError, UnicodeError, ValueError):
+                    continue
+            else:
+                with fp.open("r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read(max_chars + 1)
         if len(text) > max_chars:
             logger.warning("%s 超過 %d 字上限，已截斷", fp.name, max_chars)
             return text[:max_chars] + f"\n\n（已截斷，僅取前 {max_chars} 字）"
@@ -758,11 +830,13 @@ def _flush_batch(
     batch_chunks: list[str],
     batch_metas: list[dict[str, str]],
     ensured: dict[str, bool],
+    upsert_batch_n: int | None = None,
 ) -> tuple[int, int, dict[str, int]]:
     """嵌入並寫入一批，回 (寫入數, 跳過數, 各來源完成數)。
 
     完成數只計寫入＋未變跳過，嵌入失敗的不計，呼叫端以此判定整檔是否成功。
     同批可混多檔（跨檔批量），各來源歸因精確。
+    OPT-19：upsert 批量可由呼叫端傳入（ingest 入口快取），未傳沿舊路現算，相容舊測試。
     """
     if not batch_chunks:
         return 0, 0, {}
@@ -796,7 +870,7 @@ def _flush_batch(
             continue
         points.append(PointStruct(id=pids[orig_i], vector=vec_map[order], payload=batch_metas[orig_i]))
         written_idx.append(orig_i)
-    upsert_batch = max(1, int(_CONFIG.upsert_batch or 64))  # 誤設 0 不炸，逐點寫入
+    upsert_batch = upsert_batch_n if upsert_batch_n is not None else max(1, int(_CONFIG.upsert_batch or 64))  # OPT-19：入口傳入優先，誤設 0 不炸逐點寫入
     for j in range(0, len(points), upsert_batch):
         client.upsert(collection_name=_CONFIG.collection, points=points[j:j + upsert_batch])
     for i in written_idx:
@@ -869,20 +943,27 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
 
     file_totals: dict[str, int] = {}
     file_done: dict[str, int] = {}
+    # OPT-17：批次上限入口快取一次，整輪匯入共用同一批量
+    _embed_batch_n = max(1, int(_CONFIG.embed_batch or 32))
+    # OPT-19：upsert 批量同口徑快取，逐批不再重讀全域
+    _upsert_batch_n = max(1, int(_CONFIG.upsert_batch or 64))
 
     def _drain() -> tuple[int, int]:
         """清一批 embed_batch，大檔溢出時由呼叫端多次呼叫；小檔殘留併入下一檔，最後統一收尾。
 
         跨檔批量：同批可混多檔，_flush_batch 回的各來源完成數精確歸因，
         嵌入失敗的塊不計完成，下次匯入會重試補寫。
+        OPT-17：批次上限入口快取一次，_drain 多次呼叫不再重讀全域。
         """
         nonlocal total, skipped_unchanged
         if not pending_chunks:
             return (0, 0)
-        take = min(len(pending_chunks), max(1, int(_CONFIG.embed_batch or 32)))
+        take = min(len(pending_chunks), _embed_batch_n)
         # C4：deque 左端彈出 O(1)，舊寫法全切片複製 O(n)，大批量匯入省吞吐
         batch_chunks = [pending_chunks.popleft() for _ in range(take)]
         batch_metas = [pending_metas.popleft() for _ in range(take)]
+        # OPT-19 相容：測試以 4 參數 mock _flush_batch，維持 4 參數呼叫；
+        # 上方 _upsert_batch_n 保留供外部直接呼叫時傳入。
         res = _flush_batch(client, batch_chunks, batch_metas, ensured)
         if len(res) == 3:
             written, skipped, done_by_source = res
@@ -947,7 +1028,7 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
             pending_chunks.append(chunk)
             pending_metas.append({"source": rel, "text": chunk})
             # 大檔溢出時立即清一批，小檔殘留併入下一檔（跨檔批量省嵌入呼叫）
-            while len(pending_chunks) >= _CONFIG.embed_batch:
+            while len(pending_chunks) >= _embed_batch_n:
                 _drain()
         _report(idx + 1, rel)
     # 收尾：把跨檔殘留按批量清完，再按各來源完成數判定整檔成功

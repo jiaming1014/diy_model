@@ -13,6 +13,7 @@ import chat_core
 # 1. 搜尋快取鍵：不同 max_results 不共用快取
 # ------------------------------------------------------------
 class TestSearchCacheKey:
+    """搜尋快取鍵：不同 max_results 不共用同一格快取。"""
     def test_different_max_results_not_shared(self) -> None:
         """筆數不同不共用同一格快取，各打一次網路。」"""
         chat_core._SEARCH_CACHE.clear()
@@ -40,6 +41,7 @@ class TestSearchCacheKey:
 # 2. 搜尋 region 由 config 控制
 # ------------------------------------------------------------
 class TestSearchRegion:
+    """搜尋 region 由 config 控制，改真相即時帶進快照。"""
     def test_region_from_config(self, monkeypatch) -> None:
         """region 唯一真相在 config，改真相即時帶進快照。」"""
         chat_core._SEARCH_CACHE.clear()
@@ -57,6 +59,7 @@ class TestSearchRegion:
 # 3. LLM 查詢改寫沿用本回合 model（P15 改動的補測）
 # ------------------------------------------------------------
 class TestRewriteModel:
+    """LLM 查詢改寫沿用本回合 model，不吃 config 預設。"""
     def test_rewrite_uses_session_model(self) -> None:
         """查詢改寫用本回合模型，不吃 config 預設。」"""
         with mock.patch.object(chat_core, "QUERY_REWRITE_LLM", True):
@@ -70,6 +73,7 @@ class TestRewriteModel:
 # 4. text_utils 抽取：同名重匯出、config 即時值
 # ------------------------------------------------------------
 class TestTextUtilsExtraction:
+    """text_utils 抽取：同名重匯出同物件、截斷讀 config 即時值。"""
     def test_reexport_same_object(self) -> None:
         """chat_core 重匯出與 text_utils 同一物件，舊寫法不壞。」"""
         import text_utils
@@ -92,6 +96,7 @@ class TestTextUtilsExtraction:
 # 5. 歷史滾動摘要（opt-in：HIST_SUMMARY_ENABLE）
 # ------------------------------------------------------------
 class TestRollingSummary:
+    """歷史滾動摘要（opt-in）：開啟才壓摘要、失敗保留舊摘要、附於系統訊息。"""
     def _mk_pairs(self, n: int, size: int = 50) -> chat_core.ChatState:
         """造 N 組問答歷史，供裁切觸發摘要。」"""
         st = chat_core.ChatState()
@@ -150,6 +155,7 @@ class TestRollingSummary:
 # 6. Qdrant api_key 支援
 # ------------------------------------------------------------
 class TestQdrantApiKey:
+    """Qdrant api_key 支援：有 key 建連線時帶入、無 key 省略參數。"""
     def test_api_key_passed(self, monkeypatch) -> None:
         """有 api_key 建連線時帶入（Qdrant Cloud 用）。」"""
         import dataclasses
@@ -187,6 +193,7 @@ class TestQdrantApiKey:
 # 7. ingest CLI --progress
 # ------------------------------------------------------------
 class TestIngestProgressCli:
+    """ingest CLI --progress：有旗標傳進度回調、無旗標安靜匯入。"""
     def test_progress_flag_passes_callback(self, monkeypatch) -> None:
         """--progress 逐檔顯示，傳 callable 進度回調。」"""
         import rag_qdrant as rq

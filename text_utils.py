@@ -17,6 +17,7 @@
 from datetime import datetime
 import re
 from typing import Final
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import config as _config
@@ -70,6 +71,7 @@ _MUSIC_KEYWORDS: Final[tuple[str, ...]] = (
 _MUSIC_PLAY_VERBS: Final[tuple[str, ...]] = ("播", "點", "放", "聽")
 _MUSIC_NOUNS: Final[tuple[str, ...]] = ("歌", "音樂", "單曲", "專輯", "youtube", "油管")
 _STRIP_EDGE_RE: Final[re.Pattern[str]] = re.compile(r"^[\s，。！？、；：,.!?;:～~\-—]+|[\s，。！？、；：,.!?;:～~\-—]+$")
+_WS_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _QUERY_FILLER_RE: Final[re.Pattern[str]] = re.compile(
     r"^(請問一下|請問|幫我查一下|幫我找一下|查一下|找一下|謝謝|麻煩)[，,。\s]*|[？?！!啊呢吧喔哦]+$"
 )
@@ -102,7 +104,7 @@ def _is_date_query(query: str) -> bool:
     if not text:
         return False
     # 去空白後再量長度，避免標點／空格撐大誤判
-    compact = re.sub(r"\s+", "", text)
+    compact = _WS_RE.sub("", text)
     if len(compact) > 30:
         return False
     if any(kw in text for kw in _WEATHER_KEYWORDS):
@@ -119,7 +121,7 @@ def _is_chitchat(query: str) -> bool:
     text = _strip_edge(query).lower()
     if not text:
         return False
-    compact = re.sub(r"\s+", "", text)
+    compact = _WS_RE.sub("", text)
     if len(compact) > 20:
         return False
     # 含事實關鍵字不算閒聊，避免「你好請問天氣」被誤判跳過搜尋
@@ -167,11 +169,14 @@ def _clean_query_for_search(query: str, max_chars: int | None = None) -> str:
     budget = _config.SEARCH_QUERY_MAX_CHARS if max_chars is None else max(1, int(max_chars))
     text = _strip_edge(query.strip() if isinstance(query, str) else ("" if query is None else str(query)))
     text = _QUERY_FILLER_RE.sub("", text).strip()
-    text = re.sub(r"\s+", " ", text).strip()
+    text = _WS_RE.sub(" ", text).strip()
     return text[:budget].strip()
 
 
 # 去重時忽略的追蹤參數（utm 家族＋各平台點擊標記），其餘 query 保留以免不同文章誤判同一頁
+# OPT-11：片段與尾符正則預編譯，_normalize_url 熱路徑不再現編譯
+_FRAG_RE: Final[re.Pattern[str]] = re.compile(r"#.*$")
+_TRAIL_QS_RE: Final[re.Pattern[str]] = re.compile(r"[?&]$")
 _TRACKING_PARAM_RE: Final[re.Pattern[str]] = re.compile(
     r"([?&])(?:utm(?:_[a-z_]+)?|gclid|gbraid|wbraid|fbclid|msclkid|mc_cid|mc_eid|igshid)(=[^&]*)?",
     re.IGNORECASE,
@@ -196,11 +201,9 @@ def redact_url_creds(text: str) -> str:
 def _normalize_url(url: str) -> str:
     """URL 去重鍵：去 # 片段與追蹤參數＋去尾斜線；只小寫 scheme＋host（DNS 不分大小寫），path／query 保大小寫。」"""
     raw = url.strip() if isinstance(url, str) else ("" if url is None else str(url))
-    u = re.sub(r"#.*$", "", raw)
+    u = _FRAG_RE.sub("", raw)
     # scheme＋host 小寫即可，path／query 原樣保留（Linux 路徑大小寫敏感）
     try:
-        from urllib.parse import urlsplit, urlunsplit
-
         parts = urlsplit(u)
         if parts.netloc:
             netloc = parts.netloc if "@" in parts.netloc else parts.netloc.lower()
@@ -211,7 +214,7 @@ def _normalize_url(url: str) -> str:
     u = u.replace("?&", "?")
     while "&&" in u:
         u = u.replace("&&", "&")
-    u = re.sub(r"[?&]$", "", u).rstrip("/")
+    u = _TRAIL_QS_RE.sub("", u).rstrip("/")
     return u
 
 
@@ -229,7 +232,11 @@ def _needs_workspace(query: str) -> bool:
 
     窄語境（遊戲／聽說）：單純提及不算，只認動作關鍵字；自訂目錄名提及也算。
     """
-    text = _strip_edge(query).lower()
+    return _needs_workspace_norm(_strip_edge(query).lower())
+
+
+def _needs_workspace_norm(text: str) -> bool:
+    """工作區判定核心（吃已正規化文本），供 _detect_intent 共用一次正規化。」"""
     if not text:
         return False
     if any(w in text for w in _GAME_WORDS) or any(w in text for w in _HEARSAY_WORDS):
@@ -255,7 +262,11 @@ def _needs_music(query: str) -> bool:
     排除：含聽說只認精確關鍵字；含寫／創作且無明確音樂標記不算；
     放首排除前字為開（開放首先）。
     """
-    text = _strip_edge(query).lower()
+    return _needs_music_norm(_strip_edge(query).lower())
+
+
+def _needs_music_norm(text: str) -> bool:
+    """音樂判定核心（吃已正規化文本），供 _detect_intent 共用一次正規化。」"""
     if not text:
         return False
     if any(w in text for w in _HEARSAY_WORDS):
@@ -280,9 +291,11 @@ def _detect_intent(query: str) -> str | None:
 
     偵測不到回 None，上層走完整工具清單，寧可多送 token 也不讓功能失效。
     P21：兩者都命中（如含 YouTube 又要寫檔）回 None 給完整清單，避免誤刪工具。
+    OPT-20：正規化一次後共用內部判定，每訊息省一次 strip＋lower。
     """
-    want_music = _needs_music(query)
-    want_workspace = _needs_workspace(query)
+    text = _strip_edge(query).lower()
+    want_music = _needs_music_norm(text)
+    want_workspace = _needs_workspace_norm(text)
     if want_music and want_workspace:
         return None
     if want_music:

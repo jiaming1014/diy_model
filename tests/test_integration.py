@@ -25,6 +25,7 @@ import reranker
 # 1. chat_w 日期捷徑
 # ------------------------------------------------------------
 class TestChatDateShortcut:
+    """日期捷徑：短句含日期關鍵字直接回今天，不呼叫模型。"""
     def test_date_query_skips_model(self) -> None:
         """「今天幾號」走日期捷徑，完全不呼叫模型。"""
         with mock.patch.object(chat_core, "_ollama") as m:
@@ -37,6 +38,7 @@ class TestChatDateShortcut:
 # 2. chat_w 傳統降級路徑（search_g=False）
 # ------------------------------------------------------------
 class TestChatLegacy:
+    """傳統降級路徑：search_g=False 時走 _handle_legacy_flow 串流回覆。"""
     def test_legacy_streams_reply(self) -> None:
         """search_g=False → 走 _handle_legacy_flow，串流回覆。"""
         fake = iter(["你", "好", "！"])
@@ -51,6 +53,7 @@ class TestChatLegacy:
 # 3. chat_w 工具路徑（模型呼叫 search_web 工具）
 # ------------------------------------------------------------
 class TestChatToolFlow:
+    """工具流程：模型回 tool_calls → 執行工具 → 再串流作答。"""
     def test_tool_loop_executes_tool(self) -> None:
         """模型回 tool_calls → 執行工具 → 再串流作答（P15 串流工具輪）。"""
         import chat_core as c
@@ -79,6 +82,7 @@ class TestChatToolFlow:
 # 4. _search_web 快取
 # ------------------------------------------------------------
 class TestSearchCache:
+    """搜尋快取：同一 query 二次查詢不重打網路。"""
     def test_cached_query_skips_network(self) -> None:
         """同一 query 二次查詢，第二次不重打網路（快取命中）。"""
         results = [{"title": "t", "snippet": "s", "url": "u"}]
@@ -98,6 +102,7 @@ class TestSearchCache:
 # 5. rerank 降級：缺 CrossEncoder 套件 → 回原順序
 # ------------------------------------------------------------
 class TestRerankFallback:
+    """重排降級：CrossEncoder 不可用時回原順序，不拋錯。"""
     def test_no_cross_encoder_returns_original_order(self) -> None:
         """CrossEncoder 不可用時，rerank 回原順序（不拋錯）。"""
         docs = [{"text": "a", "source": "s1"}, {"text": "b", "source": "s2"}]
@@ -112,6 +117,7 @@ class TestRerankFallback:
 # 6. _resolve_model helper
 # ------------------------------------------------------------
 class TestResolveModel:
+    """_resolve_model：未指定走 OLLAMA_MODEL 預設，指定則優先。"""
     def test_default_uses_ollama_model(self) -> None:
         """未指定模型走 OLLAMA_MODEL 預設。」"""
         assert chat_core._resolve_model(None) == chat_core.OLLAMA_MODEL

@@ -9,6 +9,7 @@ import chat_core
 
 
 class TestTextLimit:
+    """純文字讀取上限：超限截斷並註記，不整檔載入記憶體。"""
     def test_txt_truncated(self, tmp_path: Path) -> None:
         """純文字超上限截斷並註記，不再整檔載入記憶體。」"""
         import dataclasses
@@ -25,6 +26,7 @@ class TestTextLimit:
 
 
 class TestToolDedup:
+    """工具去重：同輪同名同參只執行一次，去重鍵穩定。"""
     def test_same_call_runs_once(self) -> None:
         """同一輪內同名同參重複出現，只執行一次（P15 串流工具輪版本）。"""
         calls: list = []
@@ -51,6 +53,7 @@ class TestToolDedup:
 
 
 class TestDimFailFast:
+    """維度早失敗：收藏集維度與模型不符即拋錯，不空轉寫入。"""
     def test_mismatch_raises(self) -> None:
         """收藏集維度與模型不符早拋錯，不空轉寫入。」"""
         import rag_qdrant as rq
@@ -69,6 +72,7 @@ class TestDimFailFast:
 
 
 class TestFirstToken:
+    """首字延遲觀測：首個內容片輸出時記 debug 日誌。"""
     def test_logs_first_token(self, caplog) -> None:
         """首字延遲觀測：首個內容片輸出時記 debug 日誌。」"""
         import logging
@@ -82,6 +86,7 @@ class TestFirstToken:
 
 
 class TestIngestProgress:
+    """匯入進度回調：每檔觸發一次，回傳統一 (完成數, 總數, 檔名)。"""
     def test_callback_called(self, tmp_path: Path) -> None:
         """進度回調每檔觸發一次，回傳統一 (完成數, 總數, 檔名)。」"""
         import rag_qdrant as rq

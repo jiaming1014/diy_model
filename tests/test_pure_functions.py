@@ -20,6 +20,7 @@ from reranker import _apply_threshold, _clamp_score  # noqa: E402
 # 1. _trim_hist：組數與字數預算
 # ------------------------------------------------------------
 class TestTrimHist:
+    """_trim_hist：組數上限＋字數預算裁切。"""
     def test_trims_to_pair_limit(self) -> None:
         """超過 2*backtrace 則時裁到上限且成對。"""
         buf: list[ChatMessage] = []
@@ -53,6 +54,7 @@ class TestTrimHist:
 # 2. _stable_id：穩定雜湊
 # ------------------------------------------------------------
 class TestStableId:
+    """_stable_id：同來源同內容 ID 穩定，異內容異 ID。"""
     def test_same_content_same_id(self) -> None:
         """同來源同內容 ID 穩定，重複匯入覆寫不新增。」"""
         assert _stable_id("a.md", "hello") == _stable_id("a.md", "hello")
@@ -76,6 +78,7 @@ class TestStableId:
 # 3. _clamp_score：夾取
 # ------------------------------------------------------------
 class TestClampScore:
+    """_clamp_score：分數夾 0~10，壞值回 0 不拋錯。"""
     def test_within_range(self) -> None:
         """範圍內分數原樣通過。」"""
         assert _clamp_score(5.5) == 5.5
@@ -102,6 +105,7 @@ class TestClampScore:
 # 4. _apply_threshold：門檻過濾
 # ------------------------------------------------------------
 class TestApplyThreshold:
+    """_apply_threshold：門檻過濾、至少留 1 條、缺分數當保留。"""
     def test_no_threshold_keeps_all(self) -> None:
         """沒設門檻（-inf）全保留。」"""
         import reranker as r
@@ -154,6 +158,7 @@ class TestApplyThreshold:
 # 5. _format_rag_results：RAG 字數預算與截斷
 # ------------------------------------------------------------
 class TestFormatRagResults:
+    """_format_rag_results：RAG 字數預算與截斷。"""
     def test_empty_hits_returns_empty(self) -> None:
         """無命中回空字串。"""
         assert _format_rag_results([]) == ""
@@ -193,6 +198,7 @@ class TestFormatRagResults:
 # 6. _check_keywords：eval 評分函式
 # ------------------------------------------------------------
 class TestCheckKeywords:
+    """_check_keywords：eval 關鍵字比對。"""
     def test_all_hit(self) -> None:
         """關鍵字全中回全部。」"""
         assert _check_keywords("帶傘雷陣雨", ["帶傘", "雷陣雨"]) == ["帶傘", "雷陣雨"]
@@ -214,6 +220,7 @@ class TestCheckKeywords:
 # 7. config 一致性：三模組吃同一個真相來源
 # ------------------------------------------------------------
 class TestConfigConsistency:
+    """config 一致性：三模組吃同一個真相來源。"""
     def test_timeout_single_source(self) -> None:
         """OLLAMA_TIMEOUT 三處一致（config.py 唯一真相）。"""
         import config

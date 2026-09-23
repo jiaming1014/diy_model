@@ -37,6 +37,19 @@ from rag_qdrant import shortcut_stats as _shortcut_stats
 
 logger = logging.getLogger(__name__)
 
+# OPT-8：引用標註正則預編譯，模型層逐回覆不再現編譯
+_CITE_RE = re.compile(r"[(［\[] *(來源|筆記) *\d+ *[)］\]]")
+
+
+def _norm_keywords(keywords: list[str]) -> list[tuple[str, str]]:
+    """預正規化關鍵字：回 [(原文, 小寫去空白版)]，每 case 算一次，命中比對不再重複 lower/strip。」"""
+    out: list[tuple[str, str]] = []
+    for kw in keywords:
+        k = kw.lower().strip() if isinstance(kw, str) else ""
+        if k:
+            out.append((kw, k))
+    return out
+
 SYS_MSG = DEFAULT_SYS_MSG  # 相容舊名：值與 chat_core.DEFAULT_SYS_MSG 同一內容
 
 # 固定考題：問題＋回覆裡必須出現的關鍵字
@@ -76,20 +89,25 @@ def _check_keywords(text: str, keywords: list[str]) -> list[str]:
 
     正規化大小寫＋去空白，避免 Qdrant／ulw 大小寫誤判。
     """
-    norm = text.lower()
-    found: list[str] = []
-    for kw in keywords:
-        k = kw.lower().strip()
-        if k and k in norm:
-            found.append(kw)
-    return found
+    return _check_precomputed(text.lower(), _norm_keywords(keywords))
+
+
+def _check_precomputed(norm_text: str, norm_kws: list[tuple[str, str]]) -> list[str]:
+    """已正規化文本＋關鍵字表的比對核心，_check_keywords 與 _first_hit_rank 共用。」"""
+    return [kw for kw, k in norm_kws if k in norm_text]
 
 
 def _first_hit_rank(hits: list[dict], keywords: list[str]) -> int | None:
-    """首個全命中關鍵字的排名（1 起），無則回 None，用於 MRR。」"""
+    """首個全命中關鍵字的排名（1 起），無則回 None，用於 MRR。
+
+    OPT-12：關鍵字表每 case 正規化一次，不再每命中重算。
+    """
+    norm_kws = _norm_keywords(keywords)
+    if len(norm_kws) != len(keywords):
+        return None  # 含空關鍵字時沿舊語意永不命中（_check_keywords 恆少一）
     for i, h in enumerate(hits, start=1):
-        text = str(h.get("text", "") or "")
-        if len(_check_keywords(text, keywords)) == len(keywords):
+        text = str(h.get("text", "") or "").lower()
+        if len(_check_precomputed(text, norm_kws)) == len(norm_kws):
             return i
     return None
 
@@ -124,7 +142,7 @@ def _eval_retrieval(case: dict) -> dict:
 
 def _has_citation(reply: str) -> bool:
     """回覆有無引用標註 [來源i]／[筆記i]，純函式好測試。」"""
-    return bool(re.search(r"[(［\[] *(來源|筆記) *\d+ *[)］\]]", reply))
+    return bool(_CITE_RE.search(reply))
 
 
 def _eval_model(case: dict, model: str) -> dict:

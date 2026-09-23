@@ -14,6 +14,7 @@ import rag_qdrant as rq
 # 1. 優化主軸：模型沒叫工具的那一輪，串流內容就是答案（不再二次生成）
 # ------------------------------------------------------------
 class TestSingleCallAnswer:
+    """單次生成：模型沒叫工具的那一輪串流即答案，不二次生成。"""
     def test_no_tool_answer_single_model_call(self) -> None:
         """沒叫工具的那一輪串流即答案，只生成一次不重生。」"""
         st = chat_core.ChatState()
@@ -36,6 +37,7 @@ class TestSingleCallAnswer:
 # 2. 工具輪：一輪工具＋一輪作答＝兩次生成，且作答輪看得到工具結果
 # ------------------------------------------------------------
 class TestToolRoundStream:
+    """工具輪：一輪工具＋一輪作答＝兩次生成，作答輪看得到工具結果。"""
     def test_tool_then_answer(self) -> None:
         """一輪工具＋一輪作答＝兩次生成，作答輪看得到工具結果。」"""
         st = chat_core.ChatState()
@@ -65,6 +67,7 @@ class TestToolRoundStream:
 # 3. 預補搜：模型開跑前先搜一次（本地不夠先鋪事實、realtime 保證新鮮）
 # ------------------------------------------------------------
 class TestPreSearchFlow:
+    """預補搜：模型開跑前先搜一次，順序為 search→model。"""
     def test_presearch_before_model_call(self) -> None:
         """預補搜在模型開跑前：順序 search→model。」"""
         st = chat_core.ChatState()
@@ -91,6 +94,7 @@ class TestPreSearchFlow:
 # 4. legacy（--no-search）要真的吃本地筆記，不再白檢索
 # ------------------------------------------------------------
 class TestLegacyRagBlock:
+    """legacy（--no-search）照吃本地筆記，提示詞含筆記內容。"""
     def test_no_search_includes_rag_block(self) -> None:
         """--no-search 照吃本地筆記：提示詞含筆記內容。」"""
         st = chat_core.ChatState()
@@ -114,6 +118,7 @@ class TestLegacyRagBlock:
 # 5. 配置同步：換 Ollama client 前先關舊的（與 rag/reranker 同款）
 # ------------------------------------------------------------
 class TestClientLifecycle:
+    """配置同步：換 Ollama client 前先關舊的，共用快取快照還原。"""
     def test_sync_config_closes_replaced_client(self, monkeypatch) -> None:
         """換逾時重建 client：舊的關閉、新的上位，共用快取快照還原。」"""
         import ollama_shared
@@ -137,6 +142,7 @@ class TestClientLifecycle:
 # 6. 匯入：部分塊嵌入失敗不得標整檔 ok，否則永遠不會補壞塊
 # ------------------------------------------------------------
 class TestIngestPartialOk:
+    """匯入：部分塊嵌入失敗不標整檔 ok，壞塊下次重試補寫。"""
     def test_partial_embed_failure_not_ok(self, tmp_path: Path) -> None:
         """部分嵌入失敗不標整檔 ok，壞塊下次重試補寫。」"""
         (tmp_path / "full.md").write_text("hello world", encoding="utf-8")
@@ -168,6 +174,7 @@ class TestIngestPartialOk:
         assert cache["partial.md"]["ok"] is False
 
 class TestExistingIdNormalization:
+    """既有 ID 正規化：Qdrant 回傳加 dash UUID 也比對得上，未變塊零寫入。"""
     def test_dashed_ids_match(self) -> None:
         """Qdrant 回傳加 dash 的 UUID 也比對得上，未變塊零寫入零嵌入（曾全量重嵌）。"""
         import types
@@ -193,6 +200,7 @@ class TestExistingIdNormalization:
 # 7. 有界讀取：超過上限的內容不再載入記憶體
 # ------------------------------------------------------------
 class TestBoundedReads:
+    """有界讀取：超過上限的內容不再載入記憶體。"""
     def test_txt_does_not_read_beyond_limit(self, tmp_path: Path) -> None:
         """純文字只讀到上限＋1 字就停，尾部標記讀不到。」"""
         import dataclasses
@@ -221,6 +229,7 @@ class TestBoundedReads:
 # 8. --health 健康檢查：全通回 0、有缺回 1
 # ------------------------------------------------------------
 class TestHealthCheck:
+    """--health 健康檢查：全通回 0、有缺回 1。"""
     def test_all_ok(self) -> None:
         """全通回 0：重排雙可用＋Qdrant 有收藏集。」"""
         import types

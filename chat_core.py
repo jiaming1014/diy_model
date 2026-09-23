@@ -27,6 +27,7 @@ from typing import NotRequired  # TypedDict 中可有可無的鍵
 from typing import cast  # P16：裁切快照複本時保住 ChatMessage 型別
 from pathlib import Path  # P19：工作區路徑操作共用頂層匯入，不再各函式現 import
 import json  # 解析工具參數（arguments 可能是 JSON 字串）
+import hashlib  # OPT-10：大參數去重鍵雜湊用，避免 10 萬字重複 dumps
 import logging  # 取代 print，讓降級訊息可分級、不污染串流輸出
 import os  # 讀 OneDrive 環境變數，找真正的桌面位置
 import random  # 重試抖動用，避免驚群
@@ -104,6 +105,21 @@ except Exception:  # BROAD_EXCEPT_OK - 共用模組缺失時退化為直建，�
     _ollama = ollama.Client(timeout=OLLAMA_TIMEOUT)
 
 
+# OPT-2：單純複寫鍵清單，特殊處理（快取上限／工作區換根／逾時重建）留在 _sync_config 內
+_SYNC_SIMPLE_KEYS: Final[tuple[str, ...]] = (
+    "HIST_MAX_CHARS", "HIST_SUMMARY_ENABLE", "HIST_SUMMARY_MAX_CHARS", "HIST_SUMMARY_MIN_DROPPED",
+    "MAX_TOOL_ROUNDS", "OLLAMA_MODEL", "OLLAMA_RETRIES",
+    "QUERY_REWRITE_LLM", "RAG_ENABLE", "RAG_MAX_CHARS",
+    "RAG_MAX_RESULTS", "RAG_QUERY_MAX_CHARS",
+    "SEARCH_MAX_CHARS", "SEARCH_MAX_RESULTS", "SEARCH_QUERY_MAX_CHARS", "SEARCH_REGION",
+    "SEARCH_SNIPPET_CHARS", "SEARCH_TITLE_CHARS", "SEARCH_TIMEOUT",
+    "SEARCH_FAIL_CACHE_TTL", "SEARCH_RETRIES",
+    "USER_MAX_CHARS",
+    "WORKSPACE_MAX_FILE_CHARS", "WORKSPACE_PATH_MAX_CHARS",
+    "YOUTUBE_QUERY_MAX_CHARS",
+)
+
+
 def _sync_config() -> None:
     """P10 即時同步：把 config.py 真相重讀進本模組快照，免重啟生效。
 
@@ -121,35 +137,12 @@ def _sync_config() -> None:
     global YOUTUBE_QUERY_MAX_CHARS
     try:
         _m = _config_module
-        HIST_MAX_CHARS = _m.HIST_MAX_CHARS
-        HIST_SUMMARY_ENABLE = _m.HIST_SUMMARY_ENABLE
-        HIST_SUMMARY_MAX_CHARS = _m.HIST_SUMMARY_MAX_CHARS
-        HIST_SUMMARY_MIN_DROPPED = _m.HIST_SUMMARY_MIN_DROPPED
-        MAX_TOOL_ROUNDS = _m.MAX_TOOL_ROUNDS
-        OLLAMA_MODEL = _m.OLLAMA_MODEL
-        OLLAMA_RETRIES = _m.OLLAMA_RETRIES
-        QUERY_REWRITE_LLM = _m.QUERY_REWRITE_LLM
-        RAG_ENABLE = _m.RAG_ENABLE
-        RAG_MAX_CHARS = _m.RAG_MAX_CHARS
-        RAG_MAX_RESULTS = _m.RAG_MAX_RESULTS
-        RAG_QUERY_MAX_CHARS = _m.RAG_QUERY_MAX_CHARS
+        for _k in _SYNC_SIMPLE_KEYS:
+            globals()[_k] = getattr(_m, _k)
         _SEARCH_CACHE.update_limits(_m.SEARCH_CACHE_MAX, _m.SEARCH_CACHE_TTL)
-        SEARCH_MAX_CHARS = _m.SEARCH_MAX_CHARS
-        SEARCH_MAX_RESULTS = _m.SEARCH_MAX_RESULTS
-        SEARCH_QUERY_MAX_CHARS = _m.SEARCH_QUERY_MAX_CHARS
-        SEARCH_REGION = _m.SEARCH_REGION
-        SEARCH_SNIPPET_CHARS = _m.SEARCH_SNIPPET_CHARS
-        SEARCH_TITLE_CHARS = _m.SEARCH_TITLE_CHARS
-        SEARCH_TIMEOUT = _m.SEARCH_TIMEOUT
-        SEARCH_FAIL_CACHE_TTL = _m.SEARCH_FAIL_CACHE_TTL
-        SEARCH_RETRIES = _m.SEARCH_RETRIES
-        USER_MAX_CHARS = _m.USER_MAX_CHARS
         if WORKSPACE_DIRNAME != _m.WORKSPACE_DIRNAME:
             WORKSPACE_DIRNAME = _m.WORKSPACE_DIRNAME
             _invalidate_workspace_root()  # 工作區改名即換根，舊快取不可留；沒變不重建
-        WORKSPACE_MAX_FILE_CHARS = _m.WORKSPACE_MAX_FILE_CHARS
-        WORKSPACE_PATH_MAX_CHARS = _m.WORKSPACE_PATH_MAX_CHARS
-        YOUTUBE_QUERY_MAX_CHARS = _m.YOUTUBE_QUERY_MAX_CHARS
         if OLLAMA_TIMEOUT != _m.OLLAMA_TIMEOUT:
             OLLAMA_TIMEOUT = _m.OLLAMA_TIMEOUT
             old = _ollama
@@ -1079,9 +1072,21 @@ def _build_base_messages(sys_msg: str, user_msg: str, today: str, rag_block: str
 
 
 def _tool_call_key(name: str, args: dict[str, object]) -> tuple:
-    """工具去重鍵：同名同參視為重複，避免鬼打牆浪費搜尋。」"""
+    """工具去重鍵：同名同參視為重複，避免鬼打牆浪費搜尋。
+
+    OPT-10：大字串參數（workspace_write_file content 可達 10 萬字）先以
+    長度＋sha256 指紋代替原文再 dumps，同內容同鍵、不同內容不同鍵，
+    省掉每輪重複序列化大文本的開銷。
+    """  # noqa: E501
     try:
-        return (name, json.dumps(args, ensure_ascii=False, sort_keys=True, default=str))
+        compact: dict[str, object] = {}
+        for k, v in args.items():
+            if isinstance(v, str) and len(v) > 1000:
+                digest = hashlib.sha256(v.encode("utf-8", errors="ignore")).hexdigest()[:16]
+                compact[str(k)] = f"__hash:{len(v)}:{digest}"
+            else:
+                compact[str(k)] = v
+        return (name, json.dumps(compact, ensure_ascii=False, sort_keys=True, default=str))
     except Exception:
         # 保底鍵永不拋：混型別鍵照 repr 排，否則整輪工具作廢掉進降級
         return (name, str(sorted(args.items(), key=repr)))

@@ -15,6 +15,7 @@ from chat_core import (
 
 
 class TestUserTruncate:
+    """使用者輸入截斷：短文原樣、長文留頭加註記、去孤立代理字。"""
     def test_short_passthrough(self) -> None:
         """短輸入原樣通過，不截斷不加註記。」"""
         assert _truncate_user_msg("你好") == "你好"
@@ -33,6 +34,7 @@ class TestUserTruncate:
 
 
 class TestQueryClean:
+    """檢索查詢清洗：去口語填充詞並按上限截斷。"""
     def test_filler_removed(self) -> None:
         """口語填充詞（請問／？）去除，留檢索關鍵字。」"""
         out = _clean_query_for_search("請問台北天氣如何？")
@@ -46,6 +48,7 @@ class TestQueryClean:
 
 
 class TestUrlNormalize:
+    """URL 正規化：去大小寫與追蹤參數差異，非追蹤 query 視為不同頁。"""
     def test_same_url_variants(self) -> None:
         """大小寫＋追蹤參數＋尾斜線視為同一網址（去重用）；非追蹤 query 視為不同頁。」"""
         assert _normalize_url("https://Example.com/a/?utm_source=google") == _normalize_url("https://example.com/a")
@@ -54,6 +57,7 @@ class TestUrlNormalize:
 
 
 class TestSearchDedup:
+    """搜尋去重與單筆標題／摘要截斷。"""
     def test_duplicate_urls_deduped(self) -> None:
         """同一網址多筆只留第一筆，追蹤參數不算不同來源。」"""
         raw = [
@@ -84,6 +88,7 @@ class TestSearchDedup:
 
 
 class TestSearchBudget:
+    """搜尋結果拼接受 SEARCH_MAX_CHARS 總預算限制。"""
     def test_format_respects_budget(self) -> None:
         """搜尋結果拼提示詞受 SEARCH_MAX_CHARS 總預算限制。」"""
         hits = [
@@ -95,6 +100,7 @@ class TestSearchBudget:
 
 
 class TestRewrite:
+    """改寫開關關閉時走規則清洗，不打模型。"""
     def test_rule_fallback_when_flag_off(self) -> None:
         """改寫開關關閉時走規則清洗，不打模型。」"""
         with mock.patch.object(chat_core, "QUERY_REWRITE_LLM", False):
@@ -102,6 +108,7 @@ class TestRewrite:
 
 
 class TestQueryVecTTL:
+    """查詢向量快取：同查詢命中快取只嵌一次。"""
     def test_hit_returns_copy_and_lru(self) -> None:
         """查詢向量快取命中只嵌一次，二次查詢走快取。」"""
         import rag_qdrant as rq
@@ -116,6 +123,7 @@ class TestQueryVecTTL:
 
 
 class TestConfigRefresh:
+    """config.refresh 重讀環境變數並回傳異動表。"""
     def test_refresh_picks_new_env(self, monkeypatch) -> None:
         """refresh 重讀環境變數並回傳異動表。」"""
         import config as c
@@ -132,6 +140,7 @@ class TestConfigRefresh:
 
 
 class TestEvalMetrics:
+    """eval 檢索層指標：首個全命中排名、RR、關鍵字召回。"""
     def test_first_hit_rank(self) -> None:
         """首個全命中排名：命中回 1 起排名，無命中回 None。」"""
         from eval import _first_hit_rank

@@ -14,6 +14,7 @@ from ttl_cache import TTLCache
 # 1. 共用 TTLCache：LRU、TTL、調整上限、清空
 # ------------------------------------------------------------
 class TestTTLCache:
+    """共用 TTLCache：LRU、TTL、調整上限、清空。"""
     def test_put_get_roundtrip(self) -> None:
         """寫入讀回一致，未命中回 None。」"""
         c: TTLCache[int] = TTLCache(maxsize=2, ttl=100.0)
@@ -62,6 +63,7 @@ class TestTTLCache:
 # 2. client 生命週期：逾時沒變就不重建（舊版每次都換）
 # ------------------------------------------------------------
 class TestClientLifecycle:
+    """client 生命週期：逾時沒變就沿用舊 client，不重建不斷連線。"""
     def test_rag_keeps_client_when_timeout_unchanged(self, monkeypatch) -> None:
         """RAG 逾時沒變沿用舊 client，不重建不斷連線。」"""
         import rag_qdrant as rq
@@ -85,6 +87,7 @@ class TestClientLifecycle:
 # 3. 切塊防呆：overlap >= chunk_chars 不再無限迴圈
 # ------------------------------------------------------------
 class TestChunkGuard:
+    """切塊防呆：overlap >= chunk_chars 時不無限迴圈。"""
     def test_overlap_ge_chunk_no_hang(self) -> None:
         """重疊吃掉整塊也不卡死，10 秒內吐塊且每塊合預算。」"""
         import threading
@@ -110,6 +113,7 @@ class TestChunkGuard:
 #    舊「工具搜過就跳過補搜」的事後防重複結構已隨流程重構移除）
 # ------------------------------------------------------------
 class TestPreSearchGuard:
+    """預補搜決策：即時或本地不足才補搜，閒聊與已有來源則不補。"""
     def test_realtime_without_sources_triggers(self) -> None:
         """即時問句且無現成來源 → 先補搜。」"""
         import chat_core

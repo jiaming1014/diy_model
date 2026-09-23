@@ -12,6 +12,7 @@ from chat_core import ChatState
 
 
 def _mock_client_with_points(points):
+    """建立假的 Qdrant client，query_points 固定回傳帶 points 的結果。"""
     m = mock.MagicMock()
     m.query_points.return_value = SimpleNamespace(points=points)
     return m
@@ -21,6 +22,7 @@ class TestC1OnDemandRecall:
     """C1：重排停用時按需寬取，啟用時維持寬取。"""
 
     def _search(self, limit=3):
+        """跑 search_local 並回 (結果, 實際送出的召回 limit)。"""
         client = _mock_client_with_points([])
         with mock.patch.object(rag_qdrant, "_client", return_value=client), \
              mock.patch.object(rag_qdrant, "_embed_query_vec", return_value=[0.1] * 8):
@@ -28,18 +30,21 @@ class TestC1OnDemandRecall:
         return out, client.query_points.call_args.kwargs["limit"]
 
     def test_backend_none_uses_limit(self):
+        """後端 none 時召回量等於 limit（不寬取）。"""
         with mock.patch.object(config, "RERANK_BACKEND", "none"), \
              mock.patch.object(config, "RERANK_ENABLE", True):
             out, recall = self._search()
         assert out == [] and recall == 3
 
     def test_switch_off_uses_limit(self):
+        """RERANK_ENABLE 關閉時召回量等於 limit。"""
         with mock.patch.object(config, "RERANK_BACKEND", "auto"), \
              mock.patch.object(config, "RERANK_ENABLE", False):
             out, recall = self._search()
         assert out == [] and recall == 3
 
     def test_enabled_keeps_wide_recall(self):
+        """重排啟用時維持寬召回（max(limit, RERANK_RECALL)）。"""
         with mock.patch.object(config, "RERANK_BACKEND", "auto"), \
              mock.patch.object(config, "RERANK_ENABLE", True):
             out, recall = self._search()
@@ -50,37 +55,44 @@ class TestC2Shortcut:
     """C2：向量高分短路。"""
 
     def _hits(self, scores):
+        """把分數清單轉成帶 score 的命中清單（None 表示缺分數）。"""
         return [
             {"source": "s", "text": f"t{i}", **({"score": str(s)} if s is not None else {})}
             for i, s in enumerate(scores)
         ]
 
     def _patch_thresholds(self):
+        """回傳開啟短路＋門檻／差距的 patch 組合（供 with 疊用）。"""
         return (mock.patch.object(config, "RERANK_SHORTCUT", True),
                 mock.patch.object(config, "RERANK_SHORTCUT_MIN", 0.85),
                 mock.patch.object(config, "RERANK_SHORTCUT_GAP", 0.15))
 
     def test_triggers_on_clear_lead(self):
+        """top1 明顯領先時觸發短路。"""
         p1, p2, p3 = self._patch_thresholds()
         with p1, p2, p3:
             assert rag_qdrant._rerank_shortcut_hit(self._hits([0.92, 0.70, 0.50])) is True
 
     def test_boundary_inclusive(self):
+        """門檻邊界值（等於）視為觸發。"""
         p1, p2, p3 = self._patch_thresholds()
         with p1, p2, p3:
             assert rag_qdrant._rerank_shortcut_hit(self._hits([0.85, 0.70])) is True
 
     def test_low_top_no_trigger(self):
+        """top1 未達門檻不觸發。"""
         p1, p2, p3 = self._patch_thresholds()
         with p1, p2, p3:
             assert rag_qdrant._rerank_shortcut_hit(self._hits([0.80, 0.50])) is False
 
     def test_small_gap_no_trigger(self):
+        """與次名差距不足不觸發。"""
         p1, p2, p3 = self._patch_thresholds()
         with p1, p2, p3:
             assert rag_qdrant._rerank_shortcut_hit(self._hits([0.90, 0.85])) is False
 
     def test_bad_scores_fall_through(self):
+        """壞分數（None／nan／單筆）一律不觸發。"""
         p1, p2, p3 = self._patch_thresholds()
         with p1, p2, p3:
             assert rag_qdrant._rerank_shortcut_hit(self._hits([None, 0.5])) is False
@@ -88,10 +100,12 @@ class TestC2Shortcut:
             assert rag_qdrant._rerank_shortcut_hit(self._hits([0.9])) is False
 
     def test_switch_off(self):
+        """短路開關關閉時不觸發。"""
         with mock.patch.object(config, "RERANK_SHORTCUT", False):
             assert rag_qdrant._rerank_shortcut_hit(self._hits([0.95, 0.5])) is False
 
     def test_search_local_skips_rerank(self):
+        """短路命中時 search_local 不進重排，直接回向量序前 limit 筆。"""
         pts = [SimpleNamespace(payload={"source": "s", "text": f"t{i}"}, score=s)
                for i, s in enumerate([0.95, 0.70, 0.60, 0.50, 0.40])]
         client = _mock_client_with_points(pts)
@@ -108,6 +122,7 @@ class TestC3LazyTokens:
     """C3：字數不到一半跳過 tiktoken，超一半才算。"""
 
     def test_small_history_skips_tiktoken(self):
+        """字數未過半不呼叫 tiktoken（一旦呼叫就斷言失敗）。"""
         st = ChatState(hist=[{"role": "user", "content": "x" * 100},
                              {"role": "assistant", "content": "y" * 100}])
         with mock.patch.object(chat_core, "HIST_MAX_CHARS", 6000), \
@@ -117,6 +132,7 @@ class TestC3LazyTokens:
         assert len(st.hist) == 2
 
     def test_large_history_computes_tokens(self):
+        """字數過半時確實計算 token，但未超預算不裁。"""
         st = ChatState(hist=[{"role": "user", "content": "y" * 4000},
                              {"role": "assistant", "content": "z" * 100}])
         with mock.patch.object(chat_core, "HIST_MAX_CHARS", 6000), \
@@ -131,10 +147,12 @@ class TestC4DequeDrain:
     """C4：deque 分批與舊切片等價。"""
 
     def test_batching_identical(self, tmp_path):
+        """分批 drain 與舊切片等價：總數相符、每批不超 EMBED_BATCH、確實多批。"""
         (tmp_path / "a.txt").write_text("甲乙丙丁戊" * 40 + "\n\n" + "一二三四五" * 40, encoding="utf-8")
         sizes = []
 
         def fake_flush(client, chunks, metas, ensured):
+            """假的批次寫入：記錄每批大小並回成功統計。"""
             sizes.append(len(chunks))
             return (len(chunks), 0, {})
 
@@ -153,6 +171,7 @@ class TestC5ConfigurableRetries:
     """C5：重試次數可配，預設行為不變。"""
 
     def _run_fail(self, retries, tag):
+        """讓 DDGS 一律失敗，回 (搜尋結果, DDGS 被呼叫次數)。"""
         chat_core._SEARCH_CACHE.clear()
         with mock.patch.object(config, "SEARCH_RETRIES", retries), \
              mock.patch.object(chat_core, "DDGS", side_effect=Exception("down")) as m, \
@@ -161,10 +180,12 @@ class TestC5ConfigurableRetries:
         return out, m.call_count
 
     def test_zero_retries_single_try(self):
+        """重試 0 次＝只嘗試 1 次。"""
         out, n = self._run_fail(0, "zero")
         assert out == [] and n == 1
 
     def test_two_retries_three_tries(self):
+        """重試 2 次＝總共嘗試 3 次。"""
         out, n = self._run_fail(2, "two")
         assert out == [] and n == 3
 
@@ -173,6 +194,7 @@ class TestD3SmallBundle:
     """D3：日期捷徑不洗來源＋resolve 快取。"""
 
     def test_date_query_keeps_sources(self):
+        """日期捷徑不清空既有的來源與筆記命中。"""
         st = ChatState()
         st.last_sources.append({"title": "t", "snippet": "s", "url": "u"})
         st.last_rag.append({"source": "s", "text": "t"})
@@ -180,6 +202,7 @@ class TestD3SmallBundle:
         assert len(st.last_sources) == 1 and len(st.last_rag) == 1
 
     def test_resolved_root_cache(self, tmp_path):
+        """使用已快取的 resolve 根：正常路徑放行、穿越被擋。"""
         (tmp_path / "子").mkdir()
         resolved = tmp_path.resolve()
         with mock.patch.object(chat_core, "_workspace_root", return_value=tmp_path), \
@@ -204,9 +227,11 @@ class TestE1E2Observability:
     """E1 計數器＋E2 量尺護欄。"""
 
     def _score_hits(self, scores):
+        """把分數清單轉成帶 score 的命中清單（字串分數）。"""
         return [{"source": "s", "text": f"t{i}", "score": str(s)} for i, s in enumerate(scores)]
 
     def test_out_of_range_abstains(self):
+        """分數超出 0~1 合理範圍時棄權不觸發。"""
         p1 = mock.patch.object(config, "RERANK_SHORTCUT", True)
         p2 = mock.patch.object(config, "RERANK_SHORTCUT_MIN", 0.78)
         p3 = mock.patch.object(config, "RERANK_SHORTCUT_GAP", 0.06)
@@ -216,6 +241,7 @@ class TestE1E2Observability:
             assert rag_qdrant._rerank_shortcut_hit(self._score_hits([0.90, 0.70])) is True
 
     def test_counters_track_firing(self):
+        """短路觸發時 total／fired 計數各加一。"""
         pts = [SimpleNamespace(payload={"source": "s", "text": f"t{i}"}, score=s)
                for i, s in enumerate([0.95, 0.70, 0.60, 0.50, 0.40])]
         client = _mock_client_with_points(pts)
@@ -239,6 +265,7 @@ class TestF0F1:
     """F0 門檻護欄＋F1 評估並行保序。"""
 
     def test_threshold_set_skips_shortcut(self):
+        """設了 RERANK_THRESHOLD 就停用短路，未設才恢復觸發。"""
         hits = [{"source": "s", "text": "t0", "score": "0.95"},
                 {"source": "s", "text": "t1", "score": "0.70"}]
         base = (mock.patch.object(config, "RERANK_SHORTCUT", True),
@@ -250,16 +277,19 @@ class TestF0F1:
             assert rag_qdrant._rerank_shortcut_hit(hits) is True
 
     def test_model_layer_parallel_order(self):
+        """模型層並行評估仍依 CASES 原順序呼叫（保序）。"""
         import eval as _eval
 
         calls = []
 
         def fake_retrieval(case):
+            """假的檢索層評估：直接回全通過的固定結果。"""
             return {"q": case["q"], "pass": True, "found": [], "missing": [],
                     "hits": [], "rank": 1, "rr": 1.0, "recall": 1.0,
                     "shortcut": False, "shortcut_precise": None}
 
         def fake_model(case, model):
+            """假的模型層評估：記錄題目順序並回全通過結果。"""
             calls.append(case["q"])
             return {"q": case["q"], "pass": True, "found": [], "missing": [],
                     "used_rag": False, "used_web": False, "cited": False,
@@ -276,6 +306,7 @@ class TestJ1J4WorkspaceHardening:
     """J1–J4：可執行檔防線的繞過手法（皆已實證）與保留裝置名。"""
 
     def _write(self, tmp_path, rel):
+        """在工作區根內呼叫寫檔工具，回工具輸出文字。"""
         with mock.patch.object(chat_core, "_workspace_root", return_value=tmp_path):
             return chat_core._run_tool("workspace_write_file", {"path": rel, "content": "x"}, "test")
 

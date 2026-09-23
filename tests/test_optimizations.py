@@ -21,6 +21,7 @@ from rag_qdrant import _chunk_text, _overlap_tail, _split_sentences
 
 
 class TestRealtimeLocalPriority:
+    """即時判斷：本地意圖詞優先查本地，強即時詞才直接上網。"""
     def test_local_overrides_realtime(self) -> None:
         """含本地意圖詞（筆記）不強制即時，優先查本地。」"""
         assert _needs_realtime("今年筆記放在哪個資料夾？") is False
@@ -40,6 +41,7 @@ class TestRealtimeLocalPriority:
 
 
 class TestChitchatDateGuards:
+    """閒聊與日期判斷護欄：夾帶事實關鍵字不誤判、軟關鍵字需搭配實詞。"""
     def test_chitchat_with_weather_not_chitchat(self) -> None:
         """問候夾帶事實關鍵字不算閒聊，避免跳過搜尋。」"""
         assert _is_chitchat("你好請問天氣") is False
@@ -73,6 +75,7 @@ class TestChitchatDateGuards:
 
 
 class TestToolsLive:
+    """工具清單單例：TOOLS 與 _TOOLS_LIVE 同一物件，from 匯入跨年仍有效。"""
     def test_tools_live_same_object(self) -> None:
         """工具清單單例：TOOLS 與 _TOOLS_LIVE 同一物件，from 匯入跨年有效。」"""
         assert chat_core.TOOLS is chat_core._TOOLS_LIVE
@@ -80,6 +83,7 @@ class TestToolsLive:
 
 
 class TestSearchLRU:
+    """搜尋快取 LRU 語義：命中變最新，滿時淘汰最久未用。"""
     def test_lru_refresh_and_evict(self) -> None:
         """LRU 語義：命中變最新，滿時淘汰最久未用。」"""
         with mock.patch.object(chat_core._SEARCH_CACHE, "maxsize", 2):
@@ -96,6 +100,7 @@ class TestSearchLRU:
 
 
 class TestToolArgTypes:
+    """工具參數型別：數字／布林保原樣，search_web 查詢字串化。"""
     def test_preserves_numeric_bool(self) -> None:
         """工具參數保原始型別：數字布林不被字串化。」"""
         msg = {
@@ -117,6 +122,7 @@ class TestToolArgTypes:
 
 
 class TestRagScores:
+    """RAG 分數解析與充足判斷：濾壞值，無門檻時走內建地板。"""
     def test_parse_filters_nan_inf(self) -> None:
         """壞分數（nan／inf／缺值）跳過，只收有限數字。」"""
         hits = [
@@ -142,6 +148,7 @@ class TestRagScores:
 
 
 class TestChunking:
+    """切塊純函式：切句、重疊對齊、預算上限、短文原樣回單塊。"""
     def test_sentence_split(self) -> None:
         """中英句號切句：三句切出三句。」"""
         sents = _split_sentences("第一句。第二句！第三句？")
@@ -165,6 +172,7 @@ class TestChunking:
 
 
 class TestSystemUnify:
+    """系統訊息組裝：帶日期＋歷史快照＋本次問題，順序固定。"""
     def test_make_and_with_history(self) -> None:
         """系統訊息組裝：帶日期＋歷史快照＋本次問題，順序固定。」"""
         st = ChatState()
@@ -180,6 +188,7 @@ class TestSystemUnify:
 
 
 class TestEvalNormalize:
+    """eval 關鍵字比對：大小寫不敏感。"""
     def test_case_insensitive(self) -> None:
         """關鍵字比對大小寫不敏感，避免 Qdrant／ulw 誤判。」"""
         assert _check_keywords("QDRANT 在 6333", ["qdrant"]) == ["qdrant"]
@@ -187,6 +196,7 @@ class TestEvalNormalize:
 
 
 class TestIngestCache:
+    """匯入快取讀寫往返一致，壞檔當空不炸。"""
     def test_load_save_roundtrip(self, tmp_path: Path) -> None:
         """匯入快取讀寫往返一致，壞檔當空不炸。」"""
         import rag_qdrant as rq

@@ -54,7 +54,12 @@ class TTLCache(Generic[T]):
         return entry_ttl if entry_ttl is not None else self.ttl
 
     def get(self, key: str, now: float | None = None) -> T | None:
-        """取值：未命中或過期回 None；命中刷新順序（最近使用放尾端）。"""
+        """取值：未命中或過期回 None；命中刷新順序（最近使用放尾端）。
+
+        OPT-4：回傳的是內部本體（非拷貝），呼叫端若拿到可變物件（list／dict）
+        務必自行拷貝（如 list(hit)）再改，否則會直接污染快取。
+        chat_core／rag_qdrant 現已全數拷貝，此處僅以文件鎖定約定，不改行為。
+        """
         t = time.monotonic() if now is None else now  # now 可注入，測試免等真實時間
         with self._lock:
             item = self._data.get(key)
@@ -76,9 +81,10 @@ class TTLCache(Generic[T]):
 
         P17 懶清：舊版每次 put 全掃 O(n)，小快取無感、放大明顯；改為滿時才掃。
         P18 單筆 ttl：失敗空結果短快取用（秒），不帶沿用預設。
+        OPT-16：單筆 ttl 箝制非負，負值沿舊比較語意會寫入即過期，統一視為 0。
         """
         t = time.monotonic() if now is None else now
-        entry_ttl = float(ttl) if ttl is not None else None  # None＝沿用預設 TTL
+        entry_ttl = max(0.0, float(ttl)) if ttl is not None else None  # None＝沿用預設 TTL
         with self._lock:
             self._puts += 1
             if key in self._data:  # 同 key：直接覆寫並刷新順序
@@ -121,12 +127,15 @@ class TTLCache(Generic[T]):
             }
 
     def update_limits(self, maxsize: int | None = None, ttl: float | None = None) -> None:
-        """調整容量與過期秒數（config.refresh 用）；容量縮小立刻淘汰到符合。"""
+        """調整容量與過期秒數（config.refresh 用）；容量縮小立刻淘汰到符合。
+
+        OPT-16：ttl 箝制非負，誤設負值不再讓全快取寫入即過期。
+        """
         with self._lock:
             if maxsize is not None:
                 self.maxsize = max(1, int(maxsize))
             if ttl is not None:
-                self.ttl = float(ttl)
+                self.ttl = max(0.0, float(ttl))
             while len(self._data) > self.maxsize:  # 縮容量時立刻淘汰到符合
                 self._data.popitem(last=False)
 
