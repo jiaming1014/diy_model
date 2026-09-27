@@ -3,4 +3,4 @@
 ollama==0.6.2
 ddgs==9.16.0
 qdrant-client==1.19.1
-tzdata  # Windows 無系統時區庫，zoneinfo(Asia/Taipei) 必需；Linux／macOS 無影響
+tzdata==2026.4  # Windows 無系統時區庫，zoneinfo(Asia/Taipei) 必需；Linux／macOS 無影響；與 pyproject.toml 同步

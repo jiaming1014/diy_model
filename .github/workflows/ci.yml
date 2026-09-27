@@ -32,3 +32,22 @@ jobs:
         run: python -m pyright
       - name: Tests
         run: python -m pytest -q
+
+  # H4：主腿不裝可選依賴（降級路徑），另開輕量腿裝「免系統套件、免模型下載」的
+  # 可選依賴，跑真解析路徑（PDF／DOCX／tiktoken／prompt_toolkit）。
+  # sentence-transformers（拉 torch＋要下載模型）與 pytesseract（要系統 tesseract）不裝。
+  test-optional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install deps with light optional
+        # 版本與 requirements-optional.txt 同步，改版請兩處同步
+        run: pip install -r requirements.txt -r requirements-dev.txt pypdf==6.19.0 python-docx==1.2.0 Pillow==12.3.0 tiktoken==0.14.0 prompt_toolkit==3.0.53
+      - name: Lint
+        run: python -m ruff check .
+      - name: Tests
+        run: python -m pytest -q

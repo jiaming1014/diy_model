@@ -41,6 +41,17 @@ from ddgs import DDGS  # DuckDuckGo 搜尋，上網查資料的工具
 
 logger = logging.getLogger(__name__)  # 本模組的日誌器，上層決定要印多細
 
+
+def _sleep_search_retry() -> None:
+    """搜尋重試間隔：0.2~0.5s 隨機錯開，避免多實例同時重打驚群。」"""
+    time.sleep(random.uniform(0.2, 0.5))
+
+
+def _sleep_ollama_backoff(attempt: int, base_s: float = 0.5) -> None:
+    """Ollama 指數退避＋抖動：0.5s→1s→2s…＋0~0.2s 隨機，避免同時重撥擠爆服務。」"""
+    time.sleep(base_s * (2 ** attempt) + random.uniform(0, 0.2))
+
+
 # 優化：嘗試匯入本地 RAG 檢索，缺檔或缺套件時降級為空函式，對話不受影響
 try:
     from rag_qdrant import search_local as _rag_search  # 本地筆記向量檢索
@@ -375,17 +386,32 @@ def _get_field(message: object, key: str) -> object:
 
 _TOK_LEN_FN: object = None  # 單次綁定：首次呼叫才 import，之後直接用
 _TOK_LEN_MISSING = object()  # 哨兵：rag 缺失時記住，不再重試 import
+# OPT-22：token 數快取（歷史每輪重算，鍵為短文原文／長文雜湊），省 tiktoken 重複編碼
+_TOK_LEN_CACHE: dict[str, int] = {}
+_TOK_LEN_CACHE_MAX: Final[int] = 1024
 
 
 def _content_tokens(text: str) -> int:
     """歷史預算用尺：有 tiktoken 走 token，無則退化字數，與 rag 切塊同把尺。
 
     P13：import 只做一次，熱路徑不再重複進口。
+    OPT-22：同文 token 數快取（歷史每輪重算全量，命中省 tiktoken 編碼）。
     """
     global _TOK_LEN_FN
+    # 短文直接比長度，多數歷史訊息短，快取鍵用原文即可；長文用雜湊省記憶體
+    _txt = text or ""
+    _key: str | None = None
+    if _txt:
+        if len(_txt) <= 2000:
+            _key = _txt
+        else:
+            _key = f"h:{len(_txt)}:{hashlib.sha256(_txt.encode('utf-8', errors='ignore')).hexdigest()[:32]}"
+        _hit = _TOK_LEN_CACHE.get(_key)
+        if _hit is not None:
+            return _hit
     fn = _TOK_LEN_FN
     if fn is _TOK_LEN_MISSING:
-        return len(text or "")
+        return len(_txt)
     if fn is None:
         try:
             from rag_qdrant import _tok_len as _rag_tok_len
@@ -394,32 +420,64 @@ def _content_tokens(text: str) -> int:
             fn = _rag_tok_len
         except Exception:
             _TOK_LEN_FN = _TOK_LEN_MISSING
-            return len(text or "")
+            return len(_txt)
     try:
-        return fn(text)  # type: ignore[operator]
+        _n = fn(_txt)  # type: ignore[operator]
     except Exception:
-        return len(text or "")
+        return len(_txt)
+    if _key is not None:
+        try:
+            if len(_TOK_LEN_CACHE) >= _TOK_LEN_CACHE_MAX:
+                _TOK_LEN_CACHE.clear()
+            _TOK_LEN_CACHE[_key] = int(_n)
+        except Exception:
+            pass
+    return _n
 
 
-def _summarize_dropped(st: ChatState, dropped: list[ChatMessage], model: str | None = None) -> None:
+def _summarize_dropped(st: ChatState, dropped: list[ChatMessage], model: str | None = None, _bg: bool = False) -> None:
     """把被裁掉的舊訊息壓成滾動摘要（P16，HIST_SUMMARY_ENABLE 開啟才生效）。
 
     失敗或內容太少就什麼都不做——舊行為是直接丟棄，維持不變；
     摘要有上限字數，餵回系統訊息供長對話保留遠期記憶。
+    OPT-22：_bg=True 時背景執行緒壓摘要，不擋本輪回覆；預設同步保測試語意。
     """
     if not HIST_SUMMARY_ENABLE:
         return
     total_dropped = sum(len(str(m.get("content", "") or "")) for m in dropped)
     if total_dropped < HIST_SUMMARY_MIN_DROPPED:
         return
+    if _bg:
+        # 背景壓摘要：快照傳入，寫回加鎖概念上由 GIL 保證單次賦值原子；失敗僅記日誌
+        _snap = [cast(ChatMessage, dict(m)) for m in dropped]
+        _prev = st.summary
+        _use_model = _resolve_model(model)
+
+        def _worker() -> None:
+            try:
+                _do_summarize(st, _snap, _prev, _use_model)
+            except Exception as e:  # BROAD_EXCEPT_OK - 背景失敗不可影響對話
+                logger.warning("歷史摘要背景失敗：%s", e)
+
+        try:
+            threading.Thread(target=_worker, name="diy-summary", daemon=True).start()
+        except Exception as e:
+            logger.warning("歷史摘要背景啟動失敗，改同步：%s", e)
+            _do_summarize(st, dropped, st.summary, _resolve_model(model))
+        return
+    _do_summarize(st, dropped, st.summary, _resolve_model(model))
+
+
+def _do_summarize(st: ChatState, dropped: list[ChatMessage], prev_summary: str, use_model: str) -> None:
+    """同步壓摘要本體：組提示詞→打模型→截斷寫回，供同步／背景共用。」"""
     lines = [f"{m.get('role')}：{str(m.get('content', '') or '')[:400]}" for m in dropped]
     prompt_parts = ["請用繁體中文把下列對話壓縮成精簡摘要，保留重要事實、人名、數字與結論，不要客套話，只輸出摘要本身。"]
-    prev = st.summary.strip()
+    prev = (prev_summary or "").strip()
     if prev:
         prompt_parts.append(f"（既有摘要，請合併更新：{prev}）")
     prompt_parts.append("對話內容：\n" + "\n".join(lines))
     try:
-        msg = _call_chat_with_retry([{"role": "user", "content": "\n".join(prompt_parts)}], _resolve_model(model), None)
+        msg = _call_chat_with_retry([{"role": "user", "content": "\n".join(prompt_parts)}], use_model, None)
         raw = msg["message"] if isinstance(msg, dict) else _get_field(msg, "message")
         text = _assistant_text(raw).strip()
     except Exception as e:  # BROAD_EXCEPT_OK - 摘要失敗不可影響對話
@@ -433,7 +491,7 @@ def _summarize_dropped(st: ChatState, dropped: list[ChatMessage], model: str | N
     logger.debug("觀測 歷史摘要更新（%d 字，來源 %d 則）", len(text), len(dropped))
 
 
-def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[ChatMessage] | None = None, model: str | None = None) -> None:
+def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[ChatMessage] | None = None, model: str | None = None, _bg: bool = False) -> None:
     """裁歷史：先按組數裁，再按字數＋token 雙預算從舊裁｜新手：小抄太厚先撕整頁，還是厚就撕舊的字。
 
     優化：第一參數吃 ChatState 或裸 list（測試抓出的易誤用點），list 視為要裁的緩衝。
@@ -483,7 +541,7 @@ def _trim_hist(state: ChatState | list[ChatMessage] | None = None, target: list[
         with _hist_lock:
             del buf[:min(drop, len(buf))]
     if st_resolved is not None and dropped:
-        _summarize_dropped(st_resolved, dropped, model)
+        _summarize_dropped(st_resolved, dropped, model, _bg=_bg)
 
 
 def _remember(user_msg: str, assistant_msg: str, state: ChatState | None = None, target: list[ChatMessage] | None = None, model: str | None = None) -> None:
@@ -514,7 +572,11 @@ def _cache_put(key: str, value: list[SearchResult], ttl: float | None = None) ->
 
 
 def _search_web(query: str, max_results: int | None = None, state: ChatState | None = None) -> list[SearchResult]:
-    """DDGS 網頁搜尋，失敗回空讓上層降級｜優化：原地更新 state，不重綁全域名稱。」"""
+    """DDGS 網頁搜尋，失敗回空讓上層降級｜優化：原地更新 state，不重綁全域名稱。
+
+    同步維持直接呼叫：_sync_config 僅讀 env＋賦值，對比數秒網路可忽略；
+    先前節流省微秒卻添 40 行複雜度，已簡化回直接同步保可讀性。
+    """
     _sync_config()
     if max_results is None:
         max_results = SEARCH_MAX_RESULTS
@@ -548,7 +610,7 @@ def _search_web(query: str, max_results: int | None = None, state: ChatState | N
         except Exception as e:  # BROAD_EXCEPT_OK - httpx 錯誤型別不一，邊界統一降級
             logger.warning("網頁搜尋第 %d 次失敗：%s", attempt + 1, e)
             if attempt < max_tries - 1:
-                time.sleep(random.uniform(0.2, 0.5))
+                _sleep_search_retry()
                 continue
             logger.warning("網頁搜尋失敗，已降級為無結果")
             # P18：失敗空結果短快取，壞查詢短時間內不再打網路（TTL 見 SEARCH_FAIL_CACHE_TTL）
@@ -877,10 +939,78 @@ def _resolve_workspace_path(rel: str) -> tuple[Path | None, str | None]:
     return target, None
 
 
+def _tool_play_music(args: dict[str, object], user_msg: str) -> str:
+    """YouTube 播歌分支：組搜尋連結並開瀏覽器，失敗轉文字讓模型轉述。」"""
+    import urllib.parse
+    import webbrowser
+
+    q = str(args.get("query", "") or "").strip() or user_msg.strip()
+    q = q[:YOUTUBE_QUERY_MAX_CHARS]
+    if not q:
+        return "沒收到歌曲關鍵字，請說要聽哪首歌。"
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+    try:
+        opened = webbrowser.open(url)
+    except Exception as e:  # BROAD_EXCEPT_OK - 開瀏覽器失敗轉文字讓模型轉述
+        return f"開啟失敗，請手動開此連結：{url}（{e}）"
+    if opened:
+        return f"已在瀏覽器開啟 YouTube 搜尋「{q}」，請按第一個結果播放：{url}"
+    return f"瀏覽器沒有反應，請手動開此連結：{url}"
+
+
+def _tool_workspace_write(args: dict[str, object]) -> str:
+    """工作區寫檔分支：沙盒校驗＋可執行檔阻擋＋寫入，永不拋錯只回文字。」"""
+    _rel_raw = args.get("path", "")
+    _content_raw = args.get("content", "")
+    rel = _rel_raw if isinstance(_rel_raw, str) else ("" if _rel_raw is None else str(_rel_raw))
+    content = _content_raw if isinstance(_content_raw, str) else ("" if _content_raw is None else str(_content_raw))
+    if len(content) > WORKSPACE_MAX_FILE_CHARS:
+        return f"內容太長（{len(content)} 字），上限 {WORKSPACE_MAX_FILE_CHARS} 字，請分多次寫入。"
+    target, err = _resolve_workspace_path(rel)
+    if err is not None or target is None:
+        return err or "路徑無效。"
+    if target.exists() and target.is_dir():
+        return "同路徑已是資料夾，無法寫入檔案，請換個路徑。"
+    if _blocked_suffix(target.name) in _WORKSPACE_BLOCKED_EXTS:
+        return f"為安全起見，工作區不接受可執行檔（{_blocked_suffix(target.name)}），請改用文件格式如 .md／.txt。"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return (
+            f"已寫入 {WORKSPACE_DIRNAME}/{target.relative_to(_workspace_root())}（{len(content)} 字）。"
+            f"想讓之後的對話查到它，可執行：python rag_qdrant.py --ingest \"{_workspace_root()}\" --progress"
+            "（注意：會與個人筆記混在同一收藏集）"
+        )
+    except Exception as e:  # BROAD_EXCEPT_OK - 權限等系統錯誤轉文字讓模型轉述
+        return f"寫入失敗：{_redact_paths(str(e))}"
+
+
+def _tool_workspace_mkdir(args: dict[str, object]) -> str:
+    """工作區建資料夾分支：沙盒校驗＋已存在分流，永不拋錯只回文字。」"""
+    _rel_raw = args.get("path", "")
+    rel = _rel_raw if isinstance(_rel_raw, str) else ("" if _rel_raw is None else str(_rel_raw))
+    target, err = _resolve_workspace_path(rel)
+    if err is not None or target is None:
+        return err or "路徑無效。"
+    try:
+        target.mkdir(parents=True, exist_ok=False)
+        return f"已在 {WORKSPACE_DIRNAME} 內建立資料夾：{target.relative_to(_workspace_root())}"
+    except FileExistsError:
+        if target.is_file():
+            return "同名檔案已存在，無法建立資料夾，請換個路徑。"
+        if target.is_dir():
+            return "該資料夾已存在，未重複建立。"
+        return "路徑被已存在的檔案擋住，無法建立資料夾，請換個路徑。"
+    except Exception as e:  # BROAD_EXCEPT_OK - 權限等系統錯誤轉文字讓模型轉述
+        return f"建立失敗：{_redact_paths(str(e))}"
+
+
 def _run_tool(name: str, args: dict[str, object], user_msg: str, state: ChatState | None = None, allow_web_search: bool = True) -> str:
     """執行單一工具，回傳餵給模型的文字結果。
 
     P20：allow_web_search=False 時硬擋 search_web（子集已拿掉清單，幻覺呼叫也擋）。
+    分支實作已抽為 _tool_* helper，本函式僅做分流，行為不變。
+    同輪去重靠 _search_web 內節流同步，不改簽名保相容。
     """
     if name == "get_today":
         return f"今天是 {_today_str()}（台灣時間）。"
@@ -891,62 +1021,11 @@ def _run_tool(name: str, args: dict[str, object], user_msg: str, state: ChatStat
         query = (str(raw_q).strip() if raw_q is not None else "") or user_msg
         return _format_search_results(_search_web(query, state=state))
     if name == "play_youtube_music":
-        import urllib.parse
-        import webbrowser
-
-        q = str(args.get("query", "") or "").strip() or user_msg.strip()
-        q = q[:YOUTUBE_QUERY_MAX_CHARS]
-        if not q:
-            return "沒收到歌曲關鍵字，請說要聽哪首歌。"
-        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
-        try:
-            opened = webbrowser.open(url)
-        except Exception as e:  # BROAD_EXCEPT_OK - 開瀏覽器失敗轉文字讓模型轉述
-            return f"開啟失敗，請手動開此連結：{url}（{e}）"
-        if opened:
-            return f"已在瀏覽器開啟 YouTube 搜尋「{q}」，請按第一個結果播放：{url}"
-        return f"瀏覽器沒有反應，請手動開此連結：{url}"
+        return _tool_play_music(args, user_msg)
     if name == "workspace_write_file":
-        _rel_raw = args.get("path", "")
-        _content_raw = args.get("content", "")
-        rel = _rel_raw if isinstance(_rel_raw, str) else ("" if _rel_raw is None else str(_rel_raw))
-        content = _content_raw if isinstance(_content_raw, str) else ("" if _content_raw is None else str(_content_raw))
-        if len(content) > WORKSPACE_MAX_FILE_CHARS:
-            return f"內容太長（{len(content)} 字），上限 {WORKSPACE_MAX_FILE_CHARS} 字，請分多次寫入。"
-        target, err = _resolve_workspace_path(rel)
-        if err is not None or target is None:
-            return err or "路徑無效。"
-        if target.exists() and target.is_dir():
-            return "同路徑已是資料夾，無法寫入檔案，請換個路徑。"
-        if _blocked_suffix(target.name) in _WORKSPACE_BLOCKED_EXTS:
-            return f"為安全起見，工作區不接受可執行檔（{_blocked_suffix(target.name)}），請改用文件格式如 .md／.txt。"
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            return (
-                f"已寫入 {WORKSPACE_DIRNAME}/{target.relative_to(_workspace_root())}（{len(content)} 字）。"
-                f"想讓之後的對話查到它，可執行：python rag_qdrant.py --ingest \"{_workspace_root()}\" --progress"
-                "（注意：會與個人筆記混在同一收藏集）"
-            )
-        except Exception as e:  # BROAD_EXCEPT_OK - 權限等系統錯誤轉文字讓模型轉述
-            return f"寫入失敗：{_redact_paths(str(e))}"
+        return _tool_workspace_write(args)
     if name == "workspace_make_dir":
-        _rel_raw = args.get("path", "")
-        rel = _rel_raw if isinstance(_rel_raw, str) else ("" if _rel_raw is None else str(_rel_raw))
-        target, err = _resolve_workspace_path(rel)
-        if err is not None or target is None:
-            return err or "路徑無效。"
-        try:
-            target.mkdir(parents=True, exist_ok=False)
-            return f"已在 {WORKSPACE_DIRNAME} 內建立資料夾：{target.relative_to(_workspace_root())}"
-        except FileExistsError:
-            if target.is_file():
-                return "同名檔案已存在，無法建立資料夾，請換個路徑。"
-            if target.is_dir():
-                return "該資料夾已存在，未重複建立。"
-            return "路徑被已存在的檔案擋住，無法建立資料夾，請換個路徑。"
-        except Exception as e:  # BROAD_EXCEPT_OK - 權限等系統錯誤轉文字讓模型轉述
-            return f"建立失敗：{_redact_paths(str(e))}"
+        return _tool_workspace_mkdir(args)
     logger.warning("收到未知工具呼叫：%s，已要求模型直接回答", name)
     return f"未知工具：{name}，請直接回答使用者問題。"
 
@@ -968,8 +1047,7 @@ def _call_chat_with_retry(messages: list[ChatMessage], model: str, tools: list[d
             last_err = e
             logger.warning("ollama.chat 第 %d 次失敗：%s", attempt + 1, e)
             if attempt < OLLAMA_RETRIES:
-                # 指數退避 0.5s→1s→2s…＋隨機抖動，避免多實例同時重撥擠爆服務
-                time.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.2))
+                _sleep_ollama_backoff(attempt)
     if last_err is None:
         # P22：OLLAMA_RETRIES 負數時迴圈不跑，明確報錯（assert 在 -O 會被剝除成 raise None）
         raise RuntimeError("OLLAMA_RETRIES 設定無效（無任何重試嘗試），請設為 >= 0")
@@ -998,7 +1076,7 @@ def _stream_chat(messages: list[ChatMessage], model: str, tools: list[dict[str, 
         except Exception as e:  # BROAD_EXCEPT_OK - 建立串流失敗退避重試
             logger.warning("串流建立第 %d 次失敗（%s）", attempt + 1, e)
             if attempt < tries - 1:
-                time.sleep(random.uniform(0.2, 0.5))
+                _sleep_search_retry()
                 continue
             logger.warning("串流建立失敗，回覆為空")
             return
@@ -1117,6 +1195,7 @@ def _with_fresh_facts(base: list[ChatMessage], user_msg: str, today: str, rag_bl
     """把剛搜到的網頁事實＋本地筆記併進訊息串，供模型作答。
 
     P16：有搜到結果時附一句提示，降低模型再重複搜尋同一問題的機率。
+    同輪已由 chat_w 同步，內層走節流同步自動去重。
     """
     results = _search_web(user_msg, state=state)
     facts = _format_search_results(results)
@@ -1279,7 +1358,8 @@ def chat_w(sys_msg: str, user_msg: str, search_g: bool = True, model: str | None
         st.last_rag.clear()
         st.last_sources.clear()
     today = _today_str()
-    _trim_hist(st, model=use_model)
+    # OPT-22：入場裁切的摘要走背景，不擋本輪模型首字；回覆後 _remember 內維持同步保一致
+    _trim_hist(st, model=use_model, _bg=True)
     t0 = time.perf_counter()
     # 優化：明確要求即時資料的問句，跳過本地筆記檢索（RAG + reranker），直接進工具／搜尋流程
     # 本地筆記通常沒有新聞、股價、天氣等即時內容；先搜網更快且答案更新

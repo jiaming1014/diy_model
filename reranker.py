@@ -23,10 +23,13 @@
 """
 
 import concurrent.futures  # 給 probe 加逾時，避免 ollama.list 卡住
+import hashlib
 import json
 import logging
 import re
 import threading
+
+from ttl_cache import TTLCache
 
 # 設定唯一真相在 config.py，這裡保留同名，對外寫法與測試 mock 不變
 import config as _config_module
@@ -40,18 +43,57 @@ from config import RERANK_MODEL as RERANK_MODEL
 from config import RERANK_QUERY_MAX_CHARS as RERANK_QUERY_MAX_CHARS
 from config import RERANK_SNIPPET_CHARS as RERANK_SNIPPET_CHARS
 from config import RERANK_THRESHOLD as RERANK_THRESHOLD
+from config import RERANK_PERDOC_MAX as RERANK_PERDOC_MAX
+from config import RERANK_PERDOC_WORKERS as RERANK_PERDOC_WORKERS
 
 logger = logging.getLogger(__name__)
 
 # P17：逐筆備援上限＋並行，避免整批解析失敗時 N 次串行拖延。
 # 上限 4：預設取 3 完全夠用；本機小模型逐筆極慢，8 連打實測 300 秒做不完
-_LLM_PERDOC_MAX: int = 4  # 超過此數的文件，超出部分直接記 0 分，不再逐筆打模型
-_LLM_PERDOC_WORKERS: int = 4  # 逐筆備援並行數
+# 真相在 config.RERANK_PERDOC_MAX／WORKERS，此處留相容別名
+_LLM_PERDOC_MAX: int = RERANK_PERDOC_MAX  # 超過此數的文件，超出部分直接記 0 分，不再逐筆打模型
+_LLM_PERDOC_WORKERS: int = RERANK_PERDOC_WORKERS  # 相容別名：真相在 config.RERANK_PERDOC_WORKERS
 # OPT-13：LLM 分數數字正則預編譯，整批＋逐筆解析不再現編譯
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 # OPT-21：無窮哨兵常數化，熱路徑不再現建 float("inf")／float("-inf")
 _INF: float = float("inf")
 _NINF: float = float("-inf")
+# 重排結果快取：同問句＋同文件組重問不再重打 CrossEncoder／LLM（CPU 約省 20 秒）
+# 鍵含後端＋模型＋門檻＋top_k，改旋鈕自動分桶不誤用舊分數
+# 上限／TTL 唯一真相在 config.py（RERANK_CACHE_MAX／TTL），預設 128／3600s
+_RERANK_CACHE: TTLCache[list[dict[str, str]]] = TTLCache(
+    maxsize=int(getattr(_config_module, "RERANK_CACHE_MAX", 128)),
+    ttl=float(getattr(_config_module, "RERANK_CACHE_TTL", 3600.0)),
+)
+
+
+def _rerank_cache_key(query: str, docs: list[dict[str, str]], top_k: int) -> str:
+    """重排快取鍵：查詢＋各文件 source/text＋後端／模型／門檻／top_k。
+
+    單遍 sha256 增量餵入，避免每份文件先 hexdigest 再拼字串二次雜湊的中間配置；
+    內容仍全文參與雜湊，碰撞安全性不變。
+    """
+    h = hashlib.sha256()
+    h.update(query.strip().lower().encode("utf-8", errors="ignore"))
+    h.update(b"\x00")
+    for d in docs:
+        src = str(d.get("source", "") or "")
+        txt = str(d.get("text", "") or "")
+        h.update(str(len(src)).encode("ascii", errors="ignore"))
+        h.update(b"\x00")
+        h.update(src.encode("utf-8", errors="ignore"))
+        h.update(b"\x00")
+        h.update(str(len(txt)).encode("ascii", errors="ignore"))
+        h.update(b"\x00")
+        h.update(txt.encode("utf-8", errors="ignore"))
+        h.update(b"\x00")
+    h.update(f"k={top_k}|be={RERANK_BACKEND}|cm={RERANK_MODEL}|lm={RERANK_LLM_MODEL}|th={RERANK_THRESHOLD}".encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def clear_rerank_cache() -> None:
+    """測試／換模型用：清空重排快取。」"""
+    _RERANK_CACHE.clear()
 
 
 def _sync_config() -> None:
@@ -63,9 +105,11 @@ def _sync_config() -> None:
     global _ollama_timeout, RERANK_BACKEND, RERANK_BATCH, RERANK_ENABLE
     global RERANK_DOC_MAX_CHARS, RERANK_QUERY_MAX_CHARS
     global RERANK_LLM_MODEL, RERANK_MODEL, RERANK_SNIPPET_CHARS, RERANK_THRESHOLD
+    global RERANK_PERDOC_WORKERS, RERANK_PERDOC_MAX, _LLM_PERDOC_MAX, _LLM_PERDOC_WORKERS
     global _cross_model, _cross_model_name, _ollama, _ollama_timeout_used
     try:
         _m = _config_module
+        _old_bucket = (RERANK_BACKEND, RERANK_MODEL, RERANK_LLM_MODEL, RERANK_THRESHOLD)
         RERANK_BACKEND = _m.RERANK_BACKEND
         RERANK_BATCH = _m.RERANK_BATCH
         RERANK_ENABLE = _m.RERANK_ENABLE
@@ -74,10 +118,23 @@ def _sync_config() -> None:
         RERANK_QUERY_MAX_CHARS = _m.RERANK_QUERY_MAX_CHARS
         RERANK_SNIPPET_CHARS = _m.RERANK_SNIPPET_CHARS
         RERANK_THRESHOLD = _m.RERANK_THRESHOLD
+        RERANK_PERDOC_WORKERS = _m.RERANK_PERDOC_WORKERS
+        _LLM_PERDOC_WORKERS = _m.RERANK_PERDOC_WORKERS
+        RERANK_PERDOC_MAX = _m.RERANK_PERDOC_MAX
+        _LLM_PERDOC_MAX = _m.RERANK_PERDOC_MAX
         if RERANK_MODEL != _m.RERANK_MODEL:
             RERANK_MODEL = _m.RERANK_MODEL
             _cross_model = None
             _cross_model_name = ""
+        if _old_bucket != (RERANK_BACKEND, RERANK_MODEL, RERANK_LLM_MODEL, RERANK_THRESHOLD):
+            try:
+                _RERANK_CACHE.clear()
+            except Exception:
+                pass
+        try:
+            _RERANK_CACHE.update_limits(_m.RERANK_CACHE_MAX, _m.RERANK_CACHE_TTL)
+        except Exception as e:
+            logger.warning("重排快取上限同步失敗：%s", e)
         # ollama 超時真的變了才重建，下次 _get_ollama 會用新逾時
         # P17：改拿共用快取，快取內的舊 client 不關閉（可能他處仍在用）
         new_timeout = _m.OLLAMA_TIMEOUT
@@ -249,7 +306,7 @@ def _rerank_cross(query: str, docs: list[dict[str, str]], top_k: int) -> list[di
             logger.warning("CrossEncoder 分數數量不符（%d vs %d），降級備援", len(scores), len(docs))
             return None
         ranked = []
-        for d, s in zip(docs, scores):
+        for d, s in zip(docs, scores, strict=False):
             item = dict(d)
             item["score"] = float(s)  # pyright: ignore[reportArgumentType] - score 欄位實為數字，型別沿用舊宣告
             ranked.append(item)
@@ -348,7 +405,7 @@ def _rerank_llm(query: str, docs: list[dict[str, str]], top_k: int) -> list[dict
     if scores is None:
         return None
     ranked = []
-    for d, s in zip(scoring, scores):
+    for d, s in zip(scoring, scores, strict=False):
         item = dict(d)
         item["score"] = float(s)  # pyright: ignore[reportArgumentType] - 同上
         ranked.append(item)
@@ -357,7 +414,10 @@ def _rerank_llm(query: str, docs: list[dict[str, str]], top_k: int) -> list[dict
 
 
 def rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[str, str]]:
-    """重排主入口：自動選評審，任何失敗都回原順序前 top_k，保證不拋錯。」"""
+    """重排主入口：自動選評審，任何失敗都回原順序前 top_k，保證不拋錯。
+
+    命中快取直接回複本（省 CrossEncoder／LLM 重打）；未命中走評審後寫入快取。
+    """
     _sync_config()
     if not docs:
         return []
@@ -368,16 +428,35 @@ def rerank(query: str, docs: list[dict[str, str]], top_k: int = 3) -> list[dict[
     q = query.strip()[:RERANK_QUERY_MAX_CHARS]
     if not q:
         return docs[:top_k]
+    try:
+        _key = _rerank_cache_key(q, docs, top_k)
+        _hit = _RERANK_CACHE.get(_key)
+        if _hit is not None:
+            return [dict(d) for d in _hit]
+    except Exception:
+        _key = ""
     result: list[dict[str, str]] | None = None
     if RERANK_BACKEND in ("auto", "crossencoder"):
         result = _rerank_cross(q, docs, top_k)
         # 指定單一後端時不換備援：失敗就原順序，避免測 A 後端卻混入 B 的分數
         if result is not None or RERANK_BACKEND == "crossencoder":
             out = result if result is not None else docs[:top_k]
-            return _apply_threshold(out)
+            final = _apply_threshold(out)
+            if _key:
+                try:
+                    _RERANK_CACHE.put(_key, [dict(d) for d in final])
+                except Exception:
+                    pass
+            return final
     if RERANK_BACKEND in ("auto", "llm"):
         result = _rerank_llm(q, docs, top_k)
         if result is not None:
-            return _apply_threshold(result)
+            final = _apply_threshold(result)
+            if _key:
+                try:
+                    _RERANK_CACHE.put(_key, [dict(d) for d in final])
+                except Exception:
+                    pass
+            return final
     logger.warning("所有重排後援皆失敗，已降級為向量原順序")
     return _apply_threshold(docs[:top_k])

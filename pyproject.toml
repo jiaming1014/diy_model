@@ -8,7 +8,7 @@ dependencies = [
   "ollama==0.6.2",
   "ddgs==9.16.0",
   "qdrant-client==1.19.1",
-  "tzdata",  # Windows 無系統時區庫，zoneinfo(Asia/Taipei) 必需；與 requirements.txt 同步
+  "tzdata==2026.4",  # Windows 無系統時區庫，zoneinfo(Asia/Taipei) 必需；與 requirements.txt 同步
 ]
 
 [project.optional-dependencies]
@@ -22,7 +22,7 @@ dev = ["pytest==9.1.1", "ruff==0.16.8", "pyright==1.1.414"]  # 版本單一來�
 
 [tool.ruff]
 target-version = "py312"
-line-length = 120
+# line-length 未設：E501 在 ignore，設了也是死設定，不如不放
 exclude = ["__pycache__", ".pytest_cache", "notes"]
 
 # P13：只攔真 bug（E/F），風格類（B/UP/SIM/W）暫不強制，避免大重構。

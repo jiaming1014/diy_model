@@ -26,7 +26,6 @@ import hashlib
 import json
 import logging
 import os
-import sys
 import threading
 from pathlib import Path
 from typing import cast
@@ -35,6 +34,8 @@ from chat_core import OLLAMA_MODEL as _DEFAULT_MODEL
 from chat_core import ChatMessage, ChatState, chat_w, get_last_rag, get_last_sources
 from chat_core import DEFAULT_SYS_MSG  # P17：系統提示唯一真相在 chat_core
 import chat_core as _core
+from text_utils import LOG_FORMAT as _LOG_FORMAT
+from text_utils import ensure_utf8_stdout as _ensure_utf8_stdout
 from text_utils import redact_url_creds as _redact_url  # L1：輸出／日誌的 URL 帳密遮蔽
 
 sys_msg = DEFAULT_SYS_MSG  # 相容舊匯入：值與 chat_core.DEFAULT_SYS_MSG 同一內容
@@ -317,7 +318,14 @@ def _run_health_check(model: str) -> int:
             ok = False
     try:
         root = _core._workspace_root()
-        probe = root / ".health_probe"
+        try:
+            import rag_qdrant as _rq
+
+            _rq._sweep_stale_tmp(root, ".health_probe.*.tmp")  # 先清上次異常殘留的探針，年輕活檔不碰
+        except Exception:
+            pass
+        # pid 後綴：多開同時 --health 不互蓋；使用者自有 .health_probe 也不被误删
+        probe = root / f".health_probe.{os.getpid()}.tmp"
         try:
             # 寫得進又刪得掉才算可用，只讀目錄存在不算數
             probe.write_text("ok", encoding="utf-8")
@@ -336,16 +344,12 @@ def _run_health_check(model: str) -> int:
 def main(argv: list[str] | None = None) -> None:
     """主迴圈：不斷問「你說：」，再即時印出「小助理：」的串流回覆。」"""
     args = parse_args(argv)
-    # P16：Windows 主控台／管線輸出統一走 UTF-8，避免中文變亂碼
-    if sys.stdout is not None:
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - 執行期才有
-        except Exception:
-            pass
+    # P16：Windows 主控台／管線輸出統一走 UTF-8，避免中文變亂碼（共用 helper，三入口同一寫法）
+    _ensure_utf8_stdout()
     # 優化：force=True 讓重複 basicConfig 生效，避免第二入口的設定被吃掉
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(name)s: %(message)s",
+        format=_LOG_FORMAT,
         force=True,
     )
     if args.health:

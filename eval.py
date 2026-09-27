@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """eval.py：RAG 品質評估｜新手教學版。
 
 【這支程式在做什麼？（白話版）】
@@ -21,13 +20,11 @@
 import argparse
 import logging
 import re
-import sys
 
-try:
-    if sys.stdout is not None:
-        sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - Windows 下重設 stdout 編碼
-except Exception:
-    pass
+from text_utils import LOG_FORMAT as _LOG_FORMAT
+from text_utils import ensure_utf8_stdout as _ensure_utf8_stdout
+
+_ensure_utf8_stdout()
 
 import chat_core
 import config as _config
@@ -118,7 +115,12 @@ def _eval_retrieval(case: dict) -> dict:
     E1：順手記錄短路是否觸發＋首命中是否含關鍵字（短路精度），供閾值調整看數據。
     """
     before = _shortcut_stats()
-    hits = search_local(case["q"], limit=3)
+    # OPT-22：檢索筆數吃 RAG_MAX_RESULTS 設定，與 chat 流程一致，不再寫死 3
+    try:
+        _eval_limit = max(1, int(getattr(_config, "RAG_MAX_RESULTS", 3) or 3))
+    except (TypeError, ValueError):
+        _eval_limit = 3
+    hits = search_local(case["q"], limit=_eval_limit)
     after = _shortcut_stats()
     fired = after["fired"] > before["fired"]
     blob = "\n".join(h.get("text", "") for h in hits)
@@ -170,13 +172,36 @@ def _eval_model(case: dict, model: str) -> dict:
     }
 
 
+def _safe_eval_model(c: dict, model: str) -> dict:
+    """模型層單例安全包裝：成功直回 _eval_model，失敗記失敗 dict 不拋錯。
+
+    失敗 dict 與成功 dict 同鍵，成績單渲染不需分叉。
+    """
+    try:
+        return _eval_model(c, model)
+    except Exception as e:  # BROAD_EXCEPT_OK - 單例失敗記失敗，整批繼續
+        logger.warning("模型層單例失敗（%s）：%s", c.get("q", ""), e)
+        _kws = c.get("keywords", []) if isinstance(c.get("keywords", []), list) else []
+        return {
+            "q": c.get("q", ""),
+            "pass": False,
+            "found": [],
+            "missing": list(_kws),
+            "used_rag": False,
+            "used_web": False,
+            "cited": False,
+            "cite_pass": False,
+            "reply_head": f"（本例執行失敗：{e}）",
+        }
+
+
 def main(argv: list[str] | None = None) -> int:
     """跑完全部考題，印成績單，回傳結束碼。」"""
     ap = argparse.ArgumentParser(description="RAG 品質評估")
     ap.add_argument("--with-model", default="", help="加測模型層，例如 llama3.2:1b")
     ap.add_argument("--verbose", action="store_true", help="顯示詳細命中")
     args = ap.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, force=True)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format=_LOG_FORMAT, force=True)
     with_model = (args.with_model or "").strip()  # 空白字串視為沒給，不打模型直接出檢索成績
 
     model_label = with_model if with_model else f"{_config.OLLAMA_MODEL}（檢索層未用）"
@@ -203,10 +228,12 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 60)
         m_cases = [c for c in CASES if c.get("model")]
         # F1：各例獨立 ChatState，線程池並行省數分鐘等待；map 保序，成績單順序不變
+        # 單例隔離見 _safe_eval_model：任一例拋例外記失敗不中斷整批，成績單照印
         import concurrent.futures
+        import functools
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(4, len(m_cases)))) as ex:
-            m_results = list(ex.map(lambda c: _eval_model(c, with_model), m_cases))
+            m_results = list(ex.map(functools.partial(_safe_eval_model, model=with_model), m_cases))
         m_ok = sum(1 for r in m_results if r["pass"])
         for r in m_results:
             mark = "✅" if r["pass"] else "❌"

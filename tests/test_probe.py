@@ -57,6 +57,41 @@ class TestProbeModel:
             assert shared.probe_model("", 300.0) is False
             assert shared.probe_model("   ", 300.0) is False
 
+class TestClientCacheCap:
+    """共用 client 上限：種類異常變多時淘汰最舊，不無限成長。」"""
+    def test_evicts_oldest(self) -> None:
+        """塞滿後最舊出局，同鍵仍命中同一顆。」"""
+        import types
+
+        made: list = []
+
+        def _fake_client(timeout: float):
+            c = types.SimpleNamespace(timeout=timeout, closed=False)
+            made.append(c)
+            return c
+
+        with mock.patch("ollama.Client", side_effect=_fake_client):
+            shared.clear()
+            first = shared.get_shared_client(1000.0)
+            for i in range(1, shared._MAX_CLIENTS + 3):
+                shared.get_shared_client(1000.0 + i)
+            assert len(shared._clients) <= shared._MAX_CLIENTS
+            assert 1000.0 not in shared._clients  # 最舊已淘汰
+            assert shared.get_shared_client(1000.0 + shared._MAX_CLIENTS + 2) is not None
+            assert first.timeout == 1000.0  # 被淘汰者引用仍可用，只出快取表
+            shared.clear()
+
+    def test_remember_respects_cap(self) -> None:
+        """外部登記同樣受上限約束。」"""
+        import types
+
+        shared.clear()
+        for i in range(shared._MAX_CLIENTS + 2):
+            shared.remember(2000.0 + i, types.SimpleNamespace(timeout=2000.0 + i))
+        assert len(shared._clients) <= shared._MAX_CLIENTS
+        shared.clear()
+
+
 class TestBoolEnv:
     """布林環境變數解析：多種寫法真值表，未設或壞值回預設。"""
     def test_truth_table(self, monkeypatch) -> None:

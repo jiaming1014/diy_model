@@ -8,6 +8,7 @@
 """
 
 from pathlib import Path
+from unittest import mock
 
 # sys.path 由 tests/conftest.py 集中設定（專案根），故可直接匯入模組
 from chat_core import ChatMessage, _format_rag_results, _trim_hist, backtrace  # noqa: E402
@@ -240,3 +241,96 @@ class TestConfigConsistency:
         import config
         import rag_qdrant as rq
         assert config.EMBED_MODEL == "nomic-embed-text" == rq._CONFIG.embed_model
+
+
+# ------------------------------------------------------------
+# 8. 共用小 helper：日誌格式與 stdout 保險
+# ------------------------------------------------------------
+class TestSharedHelpers:
+    """LOG_FORMAT／ensure_utf8_stdout：三入口同一寫法，改壞立刻報錯。"""
+    def test_log_format_shape(self) -> None:
+        """格式含等級＋模組＋訊息三段。"""
+        from text_utils import LOG_FORMAT
+        assert "%(levelname)s" in LOG_FORMAT and "%(name)s" in LOG_FORMAT and "%(message)s" in LOG_FORMAT
+
+    def test_ensure_utf8_stdout_no_raise(self) -> None:
+        """任何環境呼叫不拋錯（含 stdout 為 None 的極端）。"""
+        import sys
+
+        from text_utils import ensure_utf8_stdout
+        ensure_utf8_stdout()
+        with mock.patch.object(sys, "stdout", None):
+            ensure_utf8_stdout()
+
+
+# ------------------------------------------------------------
+# 9. eval 安全包裝：失敗字典與成功同鍵
+# ------------------------------------------------------------
+class TestSafeEvalShape:
+    """_safe_eval_model：單例失敗記失敗，鍵集合與成功一致。"""
+    def test_failure_same_keys(self) -> None:
+        """失敗 dict 鍵集合等於成功 dict 鍵集合。"""
+        import eval as _eval
+
+        ok_keys = {"q", "pass", "found", "missing", "used_rag", "used_web", "cited", "cite_pass", "reply_head"}
+        with mock.patch.object(_eval, "_eval_model", side_effect=RuntimeError("boom")):
+            bad = _eval._safe_eval_model({"q": "qq", "keywords": ["k1", "k2"]}, "m")
+        assert set(bad) == ok_keys
+        assert bad["pass"] is False and bad["missing"] == ["k1", "k2"]
+
+    def test_success_passthrough(self) -> None:
+        """成功直回原 dict，不包第二層。"""
+        import eval as _eval
+
+        sentinel = {"q": "qq", "pass": True}
+        with mock.patch.object(_eval, "_eval_model", return_value=sentinel):
+            assert _eval._safe_eval_model({"q": "qq"}, "m") is sentinel
+
+
+# ------------------------------------------------------------
+# 10. 核心依賴同步：requirements.txt 與 pyproject.toml 同版本
+# ------------------------------------------------------------
+class TestCoreDepSync:
+    """核心依賴版本單一真相：兩處寫死不同步，安裝結果看運氣。」"""
+    _DEPS = ("ollama", "ddgs", "qdrant-client", "tzdata")
+
+    @staticmethod
+    def _req_versions() -> dict[str, str]:
+        """解析 requirements.txt 的 pin 版（名→版，小寫）。"""
+        from pathlib import Path as _Path
+
+        root = _Path(__file__).resolve().parent.parent
+        out: dict[str, str] = {}
+        for line in (root / "requirements.txt").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "==" not in line:
+                continue
+            name, ver = (p.strip() for p in line.split("==", 1))
+            out[name.lower()] = ver.split()[0].strip()
+        return out
+
+    @staticmethod
+    def _project_versions() -> dict[str, str]:
+        """解析 pyproject.toml dependencies 的 pin 版。」"""
+        import tomllib
+        from pathlib import Path as _Path
+
+        root = _Path(__file__).resolve().parent.parent
+        data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        out: dict[str, str] = {}
+        for dep in data["project"]["dependencies"]:
+            dep = dep.strip()
+            if "==" not in dep:
+                continue
+            name, ver = (p.strip() for p in dep.split("==", 1))
+            out[name.lower()] = ver.split()[0].strip()
+        return out
+
+    def test_core_versions_in_sync(self) -> None:
+        """四顆核心依賴兩處版本一致，漂移立刻報錯。」"""
+        req = self._req_versions()
+        proj = self._project_versions()
+        for name in self._DEPS:
+            assert name in req, f"requirements.txt 缺 {name}"
+            assert name in proj, f"pyproject.toml 缺 {name}"
+            assert req[name] == proj[name], f"{name} 漂移：requirements={req[name]} pyproject={proj[name]}"

@@ -22,6 +22,20 @@ from zoneinfo import ZoneInfo
 
 import config as _config
 
+LOG_FORMAT: Final[str] = "%(levelname)s %(name)s: %(message)s"
+
+
+def ensure_utf8_stdout() -> None:
+    """Windows 主控台／管線輸出統一走 UTF-8，避免中文變亂碼；失敗靜默略過。」"""
+    try:
+        import sys as _sys
+
+        if _sys.stdout is not None:
+            _sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - 執行期才有
+    except Exception:
+        pass
+
+
 TAIPEI_TZ: Final[str] = "Asia/Taipei"
 _WEEKDAY_ZH: Final[tuple[str, ...]] = ("一", "二", "三", "四", "五", "六", "日")
 _DATE_KEYWORDS: Final[tuple[str, ...]] = (
@@ -250,6 +264,8 @@ def _needs_workspace_norm(text: str) -> bool:
 
 # 含「聽說」的問句不走寬鬆組合判斷（「聽說這首歌…」是打聽消息不是點歌），只認精確音樂關鍵字
 _HEARSAY_WORDS: Final[tuple[str, ...]] = ("聽說", "听说", "據說", "据说")
+# OPT-22：放首排除前字為開的正則預編譯，熱路徑不再現編譯
+_FANGSHOU_RE: Final[re.Pattern[str]] = re.compile(r"(?<![開开])放首")
 _MUSIC_EXACT_KEYWORDS: Final[frozenset[str]] = frozenset({
     "youtube", "油管", "播歌", "放歌", "聽歌", "播音樂", "放音樂", "聽音樂", "播放音樂",
 })
@@ -278,7 +294,7 @@ def _needs_music_norm(text: str) -> bool:
     for kw in _MUSIC_KEYWORDS:
         if kw == "放首":
             # 「開放／开放首先登記」不是點歌：排除前字為開的命中（簡體开一起認）
-            if re.search(r"(?<![開开])放首", text):
+            if _FANGSHOU_RE.search(text):
                 return True
             continue
         if kw in text:

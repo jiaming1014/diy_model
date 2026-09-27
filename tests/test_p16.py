@@ -170,7 +170,7 @@ class TestQdrantApiKey:
         monkeypatch.setattr(rq, "_cached_key", None)
         with mock.patch.object(qdrant_client, "QdrantClient") as m_cls:
             rq._client()
-        m_cls.assert_called_once_with(url=cfg.url, api_key="secret")
+        m_cls.assert_called_once_with(url=cfg.url, api_key="secret", timeout=10)
 
     def test_no_key_omits_param(self, monkeypatch) -> None:
         """無 api_key 不帶參數，本地 Docker 直連（_client 本體走函式內 import）。」"""
@@ -186,7 +186,7 @@ class TestQdrantApiKey:
         monkeypatch.setattr(rq, "_cached_key", None)
         with mock.patch.object(qdrant_client, "QdrantClient") as m_cls:
             rq._client()
-        m_cls.assert_called_once_with(url=cfg.url)
+        m_cls.assert_called_once_with(url=cfg.url, timeout=10)
 
 
 # ------------------------------------------------------------

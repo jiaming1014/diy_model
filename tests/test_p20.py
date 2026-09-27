@@ -179,12 +179,27 @@ class TestIngestCommand:
 class TestIngestCacheAtomic:
     """匯入快取原子寫入：不留 .tmp 半檔，讀回一致。"""
     def test_no_tmp_leftover(self, tmp_path: Path) -> None:
-        """存檔不留 tmp 半檔，讀回一致。」"""
+        """存檔不留 tmp 半檔（含 pid 後綴形），讀回一致。」"""
         cache = {"a.md": {"mtime": 1.0, "size": 2, "ok": True}}
         rag_qdrant._save_ingest_cache(tmp_path, cache)
         assert (tmp_path / rag_qdrant._INGEST_CACHE_NAME).is_file()
         assert not (tmp_path / (rag_qdrant._INGEST_CACHE_NAME + ".tmp")).exists()
+        assert list(tmp_path.glob(rag_qdrant._INGEST_CACHE_NAME + ".*.tmp")) == []
         assert rag_qdrant._load_ingest_cache(tmp_path) == cache
+
+    def test_sweep_only_stale(self, tmp_path: Path) -> None:
+        """只清超齡 pid tmp，年輕活檔不碰。」"""
+        import os
+        import time
+
+        old = tmp_path / (rag_qdrant._INGEST_CACHE_NAME + ".111.tmp")
+        young = tmp_path / (rag_qdrant._INGEST_CACHE_NAME + ".222.tmp")
+        old.write_text("{}", encoding="utf-8")
+        young.write_text("{}", encoding="utf-8")
+        ancient = time.time() - 7200.0
+        os.utime(old, (ancient, ancient))
+        assert rag_qdrant._sweep_stale_tmp(tmp_path, rag_qdrant._INGEST_CACHE_NAME + ".*.tmp") == 1
+        assert not old.exists() and young.exists()
 
 
 # ------------------------------------------------------------

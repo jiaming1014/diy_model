@@ -221,6 +221,7 @@ class TestP20Hardening:
         assert rc == 0
         assert "工作區：可用" in capsys.readouterr().out
         assert not (tmp_path / ".health_probe").exists()
+        assert list(tmp_path.glob(".health_probe.*.tmp")) == []
 
 
 # ------------------------------------------------------------

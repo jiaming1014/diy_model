@@ -7,14 +7,24 @@
 
 【生命週期】
 快取內的 client 不主動關閉（可能多個模組同時在用），
-程序結束隨 GC 回收。timeout 種類通常只有一種，不會無限成長。
+程序結束隨 GC 回收。timeout 種類通常只有一種；種類異常變多時按插入順序淘汰最舊，
+上限 _MAX_CLIENTS 顆，被淘汰的實例若他處仍有引用則照常用（只出快取表）。
 """
 
 import threading
-from typing import Any
+from typing import Any, Final
 
-_clients: dict[float, Any] = {}  # timeout → client，同一個 timeout 只留一顆
+_MAX_CLIENTS: Final[int] = 8  # 正常只有 1 種 timeout，上限擋浮點抖動等異常成長
+
+_clients: dict[float, Any] = {}  # timeout → client，同一個 timeout 只留一顆（插入有序，最舊在前）
 _lock = threading.Lock()  # 保護 _clients，多模組同時取用不打架
+
+
+def _evict_oldest_locked() -> None:
+    """已持有鎖時清到上限內：踢最早插入（dict 迭代首位），不 close（可能他處仍在用）。"""
+    while len(_clients) > _MAX_CLIENTS:
+        oldest = next(iter(_clients))
+        del _clients[oldest]
 
 
 def get_shared_client(timeout: float) -> Any:
@@ -42,6 +52,7 @@ def get_shared_client(timeout: float) -> Any:
                 pass
             return hit
         _clients[key] = fresh
+        _evict_oldest_locked()
         return fresh
 
 
@@ -52,6 +63,7 @@ def remember(timeout: float, client: Any) -> None:
         raise ValueError(f"timeout 須為有限數值（收到 {timeout!r}）")
     with _lock:
         _clients[key] = client  # 覆蓋同 timeout 舊值，舊的由呼叫端負責關
+        _evict_oldest_locked()
 
 
 def is_managed(client: Any) -> bool:

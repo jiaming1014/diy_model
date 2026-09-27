@@ -13,7 +13,7 @@
 - **智慧分流**：問日期走捷徑；即時資訊直接搜網；本地可答就不打模型（P15 起單次生成）
 - **降級保證**：任何外部依賴（Ollama／Qdrant／搜尋）掛掉都有備案，不會整支炸
 - **快取**：搜尋結果＋查詢向量共用 LRU＋TTL 快取
-- **242 個測試**：全 mock、不碰網路，CI 可跑
+- **251 個測試（249 passed、2 skipped）**：全 mock、不碰網路，CI 可跑
 
 ## 系統需求
 
@@ -111,6 +111,12 @@ python eval.py --with-model llama3.2:1b
 | `RAG_QUERY_MAX_CHARS` | `500` | 檢索查詢截斷字數 |
 | `RERANK_QUERY_MAX_CHARS` | `500` | 重排打分提示詞的問題截斷字數 |
 | `RERANK_DOC_MAX_CHARS` | `2000` | CrossEncoder 配對的文件截斷字數 |
+| `RERANK_CACHE_MAX` | `128` | 重排結果快取筆數 |
+| `RERANK_CACHE_TTL` | `3600` | 重排結果快取秒數 |
+| `RERANK_PERDOC_WORKERS` | `4` | LLM 逐筆備援並行數 |
+| `RERANK_PERDOC_MAX` | `4` | LLM 逐筆備援上限筆數，超出記 0 分 |
+| `INGEST_IMAGE_MAX_SIDE` | `1024` | 視覺描述前縮圖最長邊（256~4096 箝制） |
+| `INGEST_IMAGE_JPEG_Q` | `85` | 視覺描述縮圖 JPEG 品質（50~95 箝制） |
 
 ## 效能備註（CPU 重排）
 
@@ -122,7 +128,7 @@ python eval.py --with-model llama3.2:1b
 ## 測試與靜態檢查
 
 ```bash
-python -m pytest -q     # 242 passed、2 skipped，不碰真網路
+python -m pytest -q     # 249 passed、2 skipped，不碰真網路
 python -m ruff check .  # 靜態檢查（E/F）
 python -m pyright       # 型別檢查
 ```
@@ -141,7 +147,7 @@ diy_model/
 ├── config.py         # 全域設定唯一真相
 ├── eval.py           # RAG 品質評估（檢索層 MRR／模型層引用）
 ├── notes/            # 你的筆記放這裡
-└── tests/            # 242 個測試
+└── tests/            # 251 個測試（249 passed、2 skipped）
 ```
 
 ## 流程速覽

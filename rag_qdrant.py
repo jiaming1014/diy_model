@@ -35,7 +35,7 @@ import ollama
 # 重型依賴延遲載入：qdrant_client import 約 1.6 秒，改在首次使用處函式內載入，
 # CLI 啟動／純聊天不付這筆；TYPE_CHECKING 區供靜態檢查解析型別（執行期不跑）。
 # 注意：模組 __getattr__（PEP 562）不管模組內全域查找，此處不用它。
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from qdrant_client import QdrantClient
@@ -70,6 +70,8 @@ class RAGConfig:
     chunk_max_tokens: int = _config.CHUNK_MAX_TOKENS
     query_max_chars: int = _config.RAG_QUERY_MAX_CHARS
     image_max_mb: int = _config.INGEST_IMAGE_MAX_MB
+    image_max_side: int = _config.INGEST_IMAGE_MAX_SIDE
+    image_jpeg_q: int = _config.INGEST_IMAGE_JPEG_Q
     pdf_max_pages: int = _config.INGEST_PDF_MAX_PAGES
     csv_max_rows: int = _config.INGEST_CSV_MAX_ROWS
     text_max_chars: int = _config.INGEST_TEXT_MAX_CHARS
@@ -111,6 +113,8 @@ def _sync_config() -> None:
             chunk_max_tokens=_config.CHUNK_MAX_TOKENS,
             query_max_chars=_config.RAG_QUERY_MAX_CHARS,
             image_max_mb=_config.INGEST_IMAGE_MAX_MB,
+            image_max_side=_config.INGEST_IMAGE_MAX_SIDE,
+            image_jpeg_q=_config.INGEST_IMAGE_JPEG_Q,
             pdf_max_pages=_config.INGEST_PDF_MAX_PAGES,
             csv_max_rows=_config.INGEST_CSV_MAX_ROWS,
             text_max_chars=_config.INGEST_TEXT_MAX_CHARS,
@@ -244,10 +248,11 @@ def _client() -> "QdrantClient":
             except Exception:
                 pass
         from qdrant_client import QdrantClient  # 函式內載入：平時不付 1.6 秒 import，sys.modules 快取后续呼叫
+        # OPT-22：明確帶 timeout，避免內網卡住時預設等太久；10s 連不上早失敗早降級
         if key[1]:
-            _cached_client = QdrantClient(url=key[0], api_key=key[1])
+            _cached_client = QdrantClient(url=key[0], api_key=key[1], timeout=10)
         else:
-            _cached_client = QdrantClient(url=key[0])
+            _cached_client = QdrantClient(url=key[0], timeout=10)
         _cached_key = key
         return _cached_client
 
@@ -407,16 +412,15 @@ def _embed_single_batch(texts: list[str]) -> list[list[float]] | None:
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
-    """批量嵌入，切半遞迴隔離壞塊｜新手：整疊翻譯失敗就拆兩半試，壞的那張只影響半疊。」"""
+    """批量嵌入，切半遞迴隔離壞塊｜新手：整疊翻譯失敗就拆兩半試，壞的那張只影響半疊。
+
+    實作委派給 _embed_with_order（同文去重＋保序），避免兩套切半遞迴漂移；
+    回傳按原文順序排列、跳過失敗塊（與舊行為一致）。
+    """
     if not texts:
         return []
-    ok = _embed_single_batch(texts)
-    if ok is not None:
-        return ok
-    if len(texts) == 1:
-        return []
-    mid = len(texts) // 2
-    return _embed_texts(texts[:mid]) + _embed_texts(texts[mid:])
+    ordered = _embed_with_order(texts)
+    return [ordered[i] for i in range(len(texts)) if i in ordered]
 
 
 def _embed_with_order(texts: list[str]) -> dict[int, list[float]]:
@@ -460,7 +464,7 @@ def _embed_with_order(texts: list[str]) -> dict[int, list[float]]:
         batch = [t for _, t in indexed]  # 下標稍後由 zip 回填，這裡只取文字送嵌
         ok = _embed_single_batch(batch)
         if ok is not None and len(ok) == len(indexed):
-            for (u_idx, _), vec in zip(indexed, ok):
+            for (u_idx, _), vec in zip(indexed, ok, strict=False):
                 for orig_i in groups[u_idx]:
                     out[orig_i] = vec
             return
@@ -568,6 +572,50 @@ def _read_docx(fp: Path) -> str:
     return text
 
 
+def _decode_bytes_fallback(raw: bytes, fp_name: str, encodings: tuple[str, ...]) -> str:
+    """bytes 多編碼嚴格試解，台灣常見 cp950／big5 相容，都失敗退回忽略錯誤。
+
+    回傳解碼文字；非 utf-8 系成功會記 info，全部失敗記 warning（含最後錯誤）。
+    供 CSV／TXT 小檔共用，避免兩處迴圈漂移。
+    """
+    last_err: Exception | None = None
+    for enc in encodings:
+        try:
+            text = raw.decode(enc, errors="strict")
+            if enc not in ("utf-8", "utf-8-sig"):
+                logger.info("%s 以 %s 解碼", fp_name, enc)
+            return text
+        except (UnicodeDecodeError, UnicodeError, ValueError) as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp_name, last_err)
+    else:
+        logger.warning("%s 編碼偵測失敗，已退回 utf-8 忽略錯誤", fp_name)
+    return raw.decode("utf-8-sig", errors="ignore")
+
+
+def _sniff_dialect(sample: str):
+    """CSV 分隔符嗅探：空樣本或嗅探失敗回預設 excel，三處共用防漂移。」"""
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
+    except Exception:
+        return csv.excel
+
+
+def _sniff_file_dialect(f) -> Any:
+    """已開檔的嗅探＋倒帶：讀 4096 字嗅探並 seek(0)，讀失敗視為空樣本。」"""
+    try:
+        sample = f.read(4096)
+    except Exception:
+        sample = ""
+    try:
+        f.seek(0)
+    except Exception:
+        pass
+    return _sniff_dialect(sample)
+
+
 def _read_csv(fp: Path) -> str:
     """讀 .csv：標頭＋每列轉文字，超列數截斷，只用標準庫。
 
@@ -579,11 +627,7 @@ def _read_csv(fp: Path) -> str:
 
     def _parse_text(text: str) -> tuple[list[list[str]], bool]:
         """解析已解碼文字：嗅探分隔符＋邊讀邊數，超上限即停。」"""
-        try:
-            sample = text[:4096]
-            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
-        except Exception:
-            dialect = csv.excel
+        dialect = _sniff_dialect(text[:4096])
         reader = csv.reader(io.StringIO(text), dialect)
         out: list[list[str]] = []
         cut = False
@@ -598,13 +642,7 @@ def _read_csv(fp: Path) -> str:
     def _parse_with_encoding(enc: str) -> tuple[list[list[str]], bool]:
         """用指定編碼解析，嚴格解碼，遇到解碼錯誤直接拋出換下一個編碼。」"""
         with fp.open("r", encoding=enc, errors="strict", newline="") as f:
-            try:
-                sample = f.read(4096)
-                f.seek(0)
-                dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType] - typeshed 將 delimiters 記為 str，實跑吃 list
-            except Exception:
-                f.seek(0)
-                dialect = csv.excel
+            dialect = _sniff_file_dialect(f)
             reader = csv.reader(f, dialect)
             rows: list[list[str]] = []
             truncated = False
@@ -629,19 +667,8 @@ def _read_csv(fp: Path) -> str:
             _raw = fp.read_bytes()
         except Exception:
             _raw = b""
-        for enc in ("utf-8-sig", "cp950", "big5"):
-            try:
-                _text = _raw.decode(enc, errors="strict")
-                rows, truncated = _parse_text(_text)
-                if enc != "utf-8-sig":
-                    logger.info("%s 以 %s 解碼", fp.name, enc)
-                break
-            except (UnicodeDecodeError, UnicodeError, ValueError) as e:
-                last_err = e
-                continue
-        else:
-            logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
-            rows, truncated = _parse_text(_raw.decode("utf-8-sig", errors="ignore"))
+        _text = _decode_bytes_fallback(_raw, fp.name, ("utf-8-sig", "cp950", "big5"))
+        rows, truncated = _parse_text(_text)
     else:
         for enc in ("utf-8-sig", "cp950", "big5"):
             try:
@@ -655,13 +682,7 @@ def _read_csv(fp: Path) -> str:
         else:
             logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
         with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
-            try:
-                sample = f.read(4096)
-                f.seek(0)
-                dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]) if sample.strip() else csv.excel  # pyright: ignore[reportArgumentType]
-            except Exception:
-                f.seek(0)
-                dialect = csv.excel
+            dialect = _sniff_file_dialect(f)
             reader = csv.reader(f, dialect)
             rows = []
             truncated = False
@@ -677,7 +698,7 @@ def _read_csv(fp: Path) -> str:
     lines = ["表頭：" + " | ".join(header)]
     for r in rows[1:1 + max_rows]:  # 從第 1 列開始（跳過表頭），只取上限列數
         if len(r) == len(header):
-            lines.append("；".join(f"{h}：{v}" for h, v in zip(header, r) if v))
+            lines.append("；".join(f"{h}：{v}" for h, v in zip(header, r, strict=False) if v))
         else:
             lines.append(" | ".join(r))
     if truncated:
@@ -709,16 +730,18 @@ def _read_image(fp: Path) -> str:
         pass
     try:
         try:
-            # 視覺模型前先縮圖：最長邊 1024，省 token 又更快；缺 PIL 則原圖直送降級
+            # 視覺模型前先縮圖：預設最長邊 1024，省 token 又更快；缺 PIL 則原圖直送降級
             from io import BytesIO
 
             from PIL import Image as _PilImage
 
+            _side = max(256, min(4096, int(_CONFIG.image_max_side or 1024)))
+            _qual = max(50, min(95, int(_CONFIG.image_jpeg_q or 85)))
             with _PilImage.open(fp) as _img:
                 _img = _img.convert("RGB")
-                _img.thumbnail((1024, 1024))
+                _img.thumbnail((_side, _side))
                 _buf = BytesIO()
-                _img.save(_buf, format="JPEG", quality=85)
+                _img.save(_buf, format="JPEG", quality=_qual)
                 img_bytes = _buf.getvalue()
         except Exception:
             with fp.open("rb") as f:
@@ -760,17 +783,7 @@ def _read_file_text(fp: Path) -> str:
                 _raw = fp.read_bytes()
             except Exception:
                 _raw = b""
-            text = ""
-            for enc in ("utf-8", "utf-8-sig", "cp950", "big5"):
-                try:
-                    text = _raw.decode(enc, errors="strict")
-                    if enc not in ("utf-8", "utf-8-sig"):
-                        logger.info("%s 以 %s 解碼", fp.name, enc)
-                    break
-                except (UnicodeDecodeError, UnicodeError, ValueError):
-                    continue
-            else:
-                text = _raw.decode("utf-8", errors="ignore")
+            text = _decode_bytes_fallback(_raw, fp.name, ("utf-8", "utf-8-sig", "cp950", "big5"))
             text = text[: max_chars + 1]
         else:
             # P15：只讀到上限＋1 字就停，超大純文字檔不再整檔載入記憶體
@@ -840,9 +853,9 @@ def _flush_batch(
     """
     if not batch_chunks:
         return 0, 0, {}
-    pids = [_stable_id(m["source"], t) for m, t in zip(batch_metas, batch_chunks)]
+    pids = [_stable_id(m["source"], t) for m, t in zip(batch_metas, batch_chunks, strict=False)]
     existing = _existing_text_map(client, pids)
-    todo_idx = [i for i, (pid, txt) in enumerate(zip(pids, batch_chunks)) if existing.get(pid, None) != txt]  # 查無或內文變了才需重嵌，其餘跳過
+    todo_idx = [i for i, (pid, txt) in enumerate(zip(pids, batch_chunks, strict=False)) if existing.get(pid, None) != txt]  # 查無或內文變了才需重嵌，其餘跳過
     skipped_idx = {i for i in range(len(pids))} - set(todo_idx)
     skipped = len(skipped_idx)
     done_by_source: dict[str, int] = {}
@@ -882,6 +895,31 @@ def _flush_batch(
 _INGEST_CACHE_NAME = ".ingest_cache.json"
 
 
+def _sweep_stale_tmp(root: Path, pattern: str, max_age_s: float = 3600.0) -> int:
+    """清超齡 pid 暫存殘留（如 kill -9 留下的），回清除數。
+
+    只清 mtime 超過 max_age_s 的，年輕活檔不碰，避免誤刪並行寫入中的 tmp。
+    """
+    import time as _time
+
+    count = 0
+    try:
+        now = _time.time()
+        for p in root.glob(pattern):
+            try:
+                if not p.is_file():
+                    continue
+                if now - p.stat().st_mtime < max_age_s:
+                    continue
+                p.unlink()
+                count += 1
+            except Exception:
+                continue
+    except Exception:
+        return count
+    return count
+
+
 def _load_ingest_cache(root: Path) -> dict[str, dict[str, object]]:
     """讀檔案級快取：rel -> {mtime, size, ok}，壞檔當空。」"""
     try:
@@ -895,10 +933,15 @@ def _load_ingest_cache(root: Path) -> dict[str, dict[str, object]]:
 
 
 def _save_ingest_cache(root: Path, cache: dict[str, dict[str, object]]) -> None:
-    """原子寫檔案級快取（tmp＋replace 防半寫，半路斷電不留壞檔），失敗僅警告不中斷匯入。」"""
+    """原子寫檔案級快取（tmp＋replace 防半寫，半路斷電不留壞檔），失敗僅警告不中斷匯入。
+
+    tmp 加 pid 後綴：同目錄雙開匯入不再互蓋對方的暫存檔。
+    """
     try:
+        import os as _os
+
         p = root / _INGEST_CACHE_NAME
-        tmp = root / (_INGEST_CACHE_NAME + ".tmp")
+        tmp = root / f"{_INGEST_CACHE_NAME}.{_os.getpid()}.tmp"
         tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(p)
     except Exception as e:
@@ -918,14 +961,34 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
         root = Path(folder)
     if not root.is_dir():
         raise FileNotFoundError(f"匯入資料夾不存在：{folder}")
+    _sweep_stale_tmp(root, _INGEST_CACHE_NAME + ".*.tmp")  # 先清上次異常殘留的 pid tmp，年輕活檔不碰
     # 遞迴掃支援副檔名＋實體檔，匯入快取檔本身永遠排除
-    cands = [p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_SUFFIXES and p.is_file() and p.name != _INGEST_CACHE_NAME]
-    links = sorted({str(p) for p in cands if p.is_symlink()})
+    # 單次遍歷記 (is_file, is_symlink)，避免每檔 3 次 stat（is_file＋兩次 is_symlink）
+    # OPT-22：邊掃邊分類，不留中間 _scanned 大表，大筆記庫省一次全量複製
+    files: list[Path] = []
+    _link_set: set[str] = set()
+    for p in root.rglob("*"):
+        if p.suffix.lower() not in SUPPORTED_SUFFIXES or p.name == _INGEST_CACHE_NAME:
+            continue
+        try:
+            if not p.is_file():
+                continue
+        except Exception:
+            continue
+        try:
+            _sym = p.is_symlink()
+        except Exception:
+            _sym = False
+        if _sym:
+            _link_set.add(str(p))
+        else:
+            files.append(p)
+    files.sort()
+    links = sorted(_link_set)
     if links:
         # symlink 指向 notes 外的外部內容不匯入，僅匯入實體檔
         shown = "、".join(s[:60] for s in links[:5])
         logger.warning("跳過 %d 個 symlink（僅匯入實體檔）：%s", len(links), shown)
-    files = sorted([p for p in cands if not p.is_symlink()])
     if not files:
         logger.warning("%s 內沒有支援的檔案（支援：%s），可先丟筆記進去", folder, sorted(SUPPORTED_SUFFIXES))
         return 0
@@ -954,10 +1017,12 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
         跨檔批量：同批可混多檔，_flush_batch 回的各來源完成數精確歸因，
         嵌入失敗的塊不計完成，下次匯入會重試補寫。
         OPT-17：批次上限入口快取一次，_drain 多次呼叫不再重讀全域。
+        大檔可觀測：每批 debug 記寫入／跳過／殘留，--verbose 才看得到。
         """
         nonlocal total, skipped_unchanged
         if not pending_chunks:
             return (0, 0)
+        _drain.n_calls = getattr(_drain, "n_calls", 0) + 1
         take = min(len(pending_chunks), _embed_batch_n)
         # C4：deque 左端彈出 O(1)，舊寫法全切片複製 O(n)，大批量匯入省吞吐
         batch_chunks = [pending_chunks.popleft() for _ in range(take)]
@@ -979,6 +1044,7 @@ def ingest_folder(folder: str, on_progress: object = None) -> int:
         skipped_unchanged += skipped
         for src, n in done_by_source.items():
             file_done[src] = file_done.get(src, 0) + n
+        logger.debug("觀測 匯入批量 #%d 寫入=%d 跳過=%d 殘留=%d 累計=%d", _drain.n_calls, written, skipped, len(pending_chunks), total)
         return (written, skipped)
 
     def _report(done: int, rel: str) -> None:
@@ -1162,13 +1228,9 @@ def search_local(query: str, limit: int = 3) -> list[dict[str, str]]:
 
 def main() -> int:
     """命令列入口：--ingest 匯入，--query 測試查詢；回 0 成功、1 匯入失敗（腳本可接住）。"""
-    try:  # Windows 主控台／管線統一 UTF-8，與 chat_cli／eval 同款保護
-        import sys as _sys
+    from text_utils import ensure_utf8_stdout as _ensure_utf8_stdout  # 函式內載入：三入口同一寫法，缺檔不炸 CLI
 
-        if _sys.stdout is not None:
-            _sys.stdout.reconfigure(encoding="utf-8")  # pyright: ignore[reportAttributeAccessIssue] - 執行期才有
-    except Exception:
-        pass
+    _ensure_utf8_stdout()
     ap = argparse.ArgumentParser(description="匯入筆記到 Qdrant 或測試查詢")
     ap.add_argument("--ingest", default="", help="要匯入的資料夾，例如 notes")
     ap.add_argument("--query", default="", help="測試查詢，例如 '台北天氣如何'")
