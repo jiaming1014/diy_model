@@ -638,22 +638,6 @@ def _read_csv(fp: Path) -> str:
                     cut = True
                     break
         return out, cut
-
-    def _parse_with_encoding(enc: str) -> tuple[list[list[str]], bool]:
-        """用指定編碼解析，嚴格解碼，遇到解碼錯誤直接拋出換下一個編碼。」"""
-        with fp.open("r", encoding=enc, errors="strict", newline="") as f:
-            dialect = _sniff_file_dialect(f)
-            reader = csv.reader(f, dialect)
-            rows: list[list[str]] = []
-            truncated = False
-            for r in reader:
-                if any(c.strip() for c in r):
-                    rows.append([c.strip() for c in r])
-                    if len(rows) > max_rows + 1:  # 表頭＋上限＋至少一列超額 → 確定截斷
-                        truncated = True
-                        break
-            return rows, truncated
-
     rows: list[list[str]] = []
     truncated = False
     last_err: Exception | None = None
@@ -672,7 +656,9 @@ def _read_csv(fp: Path) -> str:
     else:
         for enc in ("utf-8-sig", "cp950", "big5"):
             try:
-                rows, truncated = _parse_with_encoding(enc)
+                with fp.open("r", encoding=enc, errors="strict", newline="") as f:
+                    _text = f.read()
+                rows, truncated = _parse_text(_text)
                 if enc != "utf-8-sig":
                     logger.info("%s 以 %s 解碼", fp.name, enc)
                 break
@@ -682,16 +668,7 @@ def _read_csv(fp: Path) -> str:
         else:
             logger.warning("%s 編碼偵測失敗（%s），已退回 utf-8 忽略錯誤", fp.name, last_err)
         with fp.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
-            dialect = _sniff_file_dialect(f)
-            reader = csv.reader(f, dialect)
-            rows = []
-            truncated = False
-            for r in reader:
-                if any(c.strip() for c in r):
-                    rows.append([c.strip() for c in r])
-                    if len(rows) > max_rows + 1:
-                        truncated = True
-                        break
+            rows, truncated = _parse_text(f.read())
     if not rows:
         return ""
     header = rows[0]
@@ -750,11 +727,8 @@ def _read_image(fp: Path) -> str:
             model=_CONFIG.vision_model,
             messages=[{"role": "user", "content": f"請用繁體中文描述這張圖片的內容，包含圖中文字：{fp.name}", "images": [img_bytes]}],
         )
-        raw_msg = msg["message"] if isinstance(msg, dict) else getattr(msg, "message", None)
-        if isinstance(raw_msg, dict):
-            desc = str(raw_msg.get("content") or "")
-        else:
-            desc = str(getattr(raw_msg, "content", "") or "")
+        from ollama_shared import extract_ollama_message
+        desc = extract_ollama_message(msg)
         if desc.strip():
             return f"[圖片 {fp.name} 的視覺描述]\n{desc.strip()}"
     except Exception:

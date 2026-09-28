@@ -338,8 +338,8 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
     )
     try:
         msg = client.chat(model=RERANK_LLM_MODEL, messages=[{"role": "user", "content": prompt}])
-        raw = msg["message"] if isinstance(msg, dict) else getattr(msg, "message", None)
-        text = str(raw.get("content") if isinstance(raw, dict) else getattr(raw, "content", "") or "")
+        from ollama_shared import extract_ollama_message
+        text = extract_ollama_message(msg)
     except Exception as e:
         logger.warning("LLM 重排呼叫失敗（%s），降級為原順序", e)
         return None
@@ -372,8 +372,8 @@ def _llm_scores(query: str, docs: list[dict[str, str]]) -> list[float] | None:
                 model=RERANK_LLM_MODEL,
                 messages=[{"role": "user", "content": f"你是檢索評分員。依與問題的相關程度，為文件打 0~10 分，只回一個數字。\n問題：{query[:RERANK_QUERY_MAX_CHARS]}\n文件：{snippet}"}],
             )
-            s_raw = single["message"] if isinstance(single, dict) else getattr(single, "message", None)
-            s_text = str(s_raw.get("content") if isinstance(s_raw, dict) else getattr(s_raw, "content", "") or "")
+            from ollama_shared import extract_ollama_message
+            s_text = extract_ollama_message(single)
             m = _NUM_RE.search(s_text)
             return idx, (_clamp_score(m.group(0)) if m else 0.0)
         except Exception as e:

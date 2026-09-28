@@ -80,16 +80,6 @@ def _content_key(role: object, content: object) -> tuple:
     return (role, len(text), digest)
 
 
-def _trim_tail_to_budget(msgs: list[dict]) -> list[dict]:
-    """按 HIST_MAX_CHARS 雙預算從舊裁剪，轉調 chat_core._trim_hist 保單一真相（回新清單，不動原輸入）。"""
-    buf = [dict(m) for m in msgs]  # 淺拷貝一份再裁，原輸入保持不動
-    try:
-        _core._trim_hist(cast(list[ChatMessage], buf))
-    except Exception:
-        return msgs
-    return buf
-
-
 _HIST_FILE_MAX_BYTES: int = 1_000_000  # 歷史檔讀取上限，被外部撐大時從空開始不硬讀
 
 
@@ -99,10 +89,12 @@ def _load_history(state: ChatState, path: Path | None = None) -> None:
     try:
         if not p.is_file():
             return
-        if p.stat().st_size > _HIST_FILE_MAX_BYTES:
-            logging.getLogger(__name__).warning("歷史檔過大（%d 位元組），已從空開始：%s", p.stat().st_size, p)
+        # 一次 read_text 取代 stat+read 雙 syscall，讀完再檢查 byte 長度
+        raw_text = p.read_text(encoding="utf-8")
+        if len(raw_text.encode("utf-8")) > _HIST_FILE_MAX_BYTES:
+            logging.getLogger(__name__).warning("歷史檔過大（%d 字元），已從空開始：%s", len(raw_text), p)
             return
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(raw_text)
         if isinstance(data, list):
             for m in data[-_hist_keep_n():]:
                 if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
@@ -137,7 +129,12 @@ def _save_history(state: ChatState, path: Path | None = None) -> None:
                     seen.add(key)
                     dedup.append(m)
             dedup.reverse()
-            tail = _trim_tail_to_budget(dedup[-_hist_keep_n():])  # 取最後 N 組（最新的留，舊的裁）
+            tail_buf = [dict(m) for m in dedup[-_hist_keep_n():]]  # 淺拷貝一份再裁，原輸入保持不動
+            try:
+                _core._trim_hist(cast(list[ChatMessage], tail_buf))
+            except Exception:
+                tail_buf = dedup[-_hist_keep_n():]
+            tail = tail_buf  # 取最後 N 組（最新的留，舊的裁）
             for m in tail:  # 模型回覆若夾代理字會炸存檔致永遠存不了，先消毒（正常字串無影響）
                 c = m.get("content", "")
                 if isinstance(c, str):

@@ -104,6 +104,7 @@ from text_utils import _needs_realtime as _needs_realtime
 from text_utils import _needs_workspace as _needs_workspace
 from text_utils import _normalize_url as _normalize_url
 from text_utils import _strip_edge as _strip_edge
+from text_utils import _to_str_or_empty as _to_str_or_empty
 from text_utils import _today_str as _today_str
 from text_utils import _truncate_user_msg as _truncate_user_msg
 
@@ -428,7 +429,9 @@ def _content_tokens(text: str) -> int:
     if _key is not None:
         try:
             if len(_TOK_LEN_CACHE) >= _TOK_LEN_CACHE_MAX:
-                _TOK_LEN_CACHE.clear()
+                # 刪半（LRU 精神）：保留近期熱句，避免全清造成命中率懸崖
+                for _old_key in list(_TOK_LEN_CACHE)[: _TOK_LEN_CACHE_MAX // 2]:
+                    _TOK_LEN_CACHE.pop(_old_key, None)
             _TOK_LEN_CACHE[_key] = int(_n)
         except Exception:
             pass
@@ -478,8 +481,8 @@ def _do_summarize(st: ChatState, dropped: list[ChatMessage], prev_summary: str, 
     prompt_parts.append("對話內容：\n" + "\n".join(lines))
     try:
         msg = _call_chat_with_retry([{"role": "user", "content": "\n".join(prompt_parts)}], use_model, None)
-        raw = msg["message"] if isinstance(msg, dict) else _get_field(msg, "message")
-        text = _assistant_text(raw).strip()
+        from ollama_shared import extract_ollama_message
+        text = extract_ollama_message(msg).strip()
     except Exception as e:  # BROAD_EXCEPT_OK - 摘要失敗不可影響對話
         logger.warning("歷史摘要失敗，裁掉內容照舊丟棄：%s", e)
         return
@@ -661,8 +664,8 @@ def _maybe_llm_rewrite(query: str, model: str | None = None) -> str:
             _resolve_model(model),
             None,
         )
-        raw = msg["message"] if isinstance(msg, dict) else _get_field(msg, "message")
-        text = _assistant_text(raw).strip()
+        from ollama_shared import extract_ollama_message
+        text = extract_ollama_message(msg).strip()
         return _clean_query_for_search(text, max_chars=RAG_QUERY_MAX_CHARS) or cleaned
     except Exception as e:
         logger.warning("查詢改寫失敗，用規則版：%s", e)
@@ -960,10 +963,8 @@ def _tool_play_music(args: dict[str, object], user_msg: str) -> str:
 
 def _tool_workspace_write(args: dict[str, object]) -> str:
     """工作區寫檔分支：沙盒校驗＋可執行檔阻擋＋寫入，永不拋錯只回文字。」"""
-    _rel_raw = args.get("path", "")
-    _content_raw = args.get("content", "")
-    rel = _rel_raw if isinstance(_rel_raw, str) else ("" if _rel_raw is None else str(_rel_raw))
-    content = _content_raw if isinstance(_content_raw, str) else ("" if _content_raw is None else str(_content_raw))
+    rel = _to_str_or_empty(args.get("path", ""))
+    content = _to_str_or_empty(args.get("content", ""))
     if len(content) > WORKSPACE_MAX_FILE_CHARS:
         return f"內容太長（{len(content)} 字），上限 {WORKSPACE_MAX_FILE_CHARS} 字，請分多次寫入。"
     target, err = _resolve_workspace_path(rel)
@@ -987,8 +988,7 @@ def _tool_workspace_write(args: dict[str, object]) -> str:
 
 def _tool_workspace_mkdir(args: dict[str, object]) -> str:
     """工作區建資料夾分支：沙盒校驗＋已存在分流，永不拋錯只回文字。」"""
-    _rel_raw = args.get("path", "")
-    rel = _rel_raw if isinstance(_rel_raw, str) else ("" if _rel_raw is None else str(_rel_raw))
+    rel = _to_str_or_empty(args.get("path", ""))
     target, err = _resolve_workspace_path(rel)
     if err is not None or target is None:
         return err or "路徑無效。"
@@ -1076,7 +1076,7 @@ def _stream_chat(messages: list[ChatMessage], model: str, tools: list[dict[str, 
         except Exception as e:  # BROAD_EXCEPT_OK - 建立串流失敗退避重試
             logger.warning("串流建立第 %d 次失敗（%s）", attempt + 1, e)
             if attempt < tries - 1:
-                _sleep_search_retry()
+                _sleep_ollama_backoff(attempt)
                 continue
             logger.warning("串流建立失敗，回覆為空")
             return
