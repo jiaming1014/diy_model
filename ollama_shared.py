@@ -11,6 +11,7 @@
 上限 _MAX_CLIENTS 顆，被淘汰的實例若他處仍有引用則照常用（只出快取表）。
 """
 
+import concurrent.futures
 import threading
 from typing import Any, Final
 
@@ -103,17 +104,29 @@ def ollama_model_names(models: object) -> list[str]:
     return names
 
 
-def probe_model(model: str, timeout: float, timeout_s: float = 5.0) -> bool:
-    """探測指定模型是否在 Ollama 就緒，逾時當不可用｜新手：--health 出發前點名，缺誰早知道。
+# 模組級共用執行緒池：probe_model 每次新建池會重複建立/銷毀執行緒，共用省開銷
+_PROBE_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+_PROBE_POOL_LOCK = threading.Lock()
 
-    名單比對沿用重排探測的寬鬆規則（大小寫不敏感、任一包含即算）。
+
+def _get_probe_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """取得模組級共用執行緒池（延遲建立，max_workers=1 足以為 list() 加逾時）。"""
+    global _PROBE_POOL
+    with _PROBE_POOL_LOCK:
+        if _PROBE_POOL is None:
+            _PROBE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        return _PROBE_POOL
+
+
+def probe_model(model: str, timeout: float, timeout_s: float = 5.0) -> bool:
+    """偵測指定模型是否在 Ollama 就緒，逾時當不可用｜新手：--health 出發前點名，缺誰早知道。
+
+    名單比對沿用重排偵測的寬鬆規則（大小寫不敏感、任一包含即算）。
     """
     try:
-        import concurrent.futures
-
         client = get_shared_client(timeout)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            models = ex.submit(client.list).result(timeout=timeout_s)
+        ex = _get_probe_pool()
+        models = ex.submit(client.list).result(timeout=timeout_s)
     except Exception:
         return False
     names = ollama_model_names(models)
@@ -121,6 +134,24 @@ def probe_model(model: str, timeout: float, timeout_s: float = 5.0) -> bool:
         return True  # 連線成功但形狀不明，保守當可用（實際呼叫失敗時上層會再降級）
     want = (model or "").strip().lower()
     return bool(want) and any(want in n.lower() or n.lower() in want for n in names if n)
+
+
+def extract_ollama_message(msg: object) -> str:
+    """從 Ollama 回覆物件取出 message 文字，認 dict／回傳物件（含 .message 的 ChatResponse）。
+
+    舊版各模組各自判斷 msg 是 dict 還是物件，格式漂移時要改多處；
+    統一抽到這裡，Ollama SDK 改回覆格式只需改一處。
+    """
+    try:
+        if isinstance(msg, dict):
+            raw = msg.get("message")
+        else:
+            raw = getattr(msg, "message", None)
+        if isinstance(raw, dict):
+            return str(raw.get("content") or "")
+        return str(raw) if raw is not None else ""
+    except Exception:
+        return ""
 
 
 def clear() -> None:

@@ -164,8 +164,21 @@ def _needs_realtime(query: str) -> bool:
     return True
 
 
+def _to_str_or_empty(value: object) -> str:
+    """把任意值轉為字串：None 回空字串，str 原樣回，其他型別 str()。
+
+    工具參數（path／content）可能從 JSON 解析出數字／布林／None，
+    統一轉字串避免各工具自行處理型別漂移。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def _truncate_user_msg(msg: str) -> str:
-    """使用者輸入截斷防爆：超 USER_MAX_CHARS 留頭＋註記，避免單輪撐爆上下文。」"""
+    """使用者輸入截斷防爆：超 USER_MAX_CHARS 留頭＋註記，避免單輪撐爆上下文。"""
     max_chars = _config.USER_MAX_CHARS
     text = msg.strip() if isinstance(msg, str) else ("" if msg is None else str(msg))
     # 管線／轉貼可能帶進孤立代理字（surrogates），會炸 json 存檔與模型序列化，入口先清掉
